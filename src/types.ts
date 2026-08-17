@@ -1,19 +1,38 @@
-export type Category =
-  | "income"
-  | "groceries"
-  | "dining"
-  | "transport"
-  | "housing"
-  | "utilities"
-  | "entertainment"
-  | "health"
-  | "shopping"
-  | "other";
+export const CATEGORIES = [
+  "income",
+  "groceries",
+  "dining",
+  "transport",
+  "housing",
+  "utilities",
+  "entertainment",
+  "health",
+  "shopping",
+  "other",
+] as const;
+
+export type Category = (typeof CATEGORIES)[number];
+export type SpendingCategory = Exclude<Category, "income">;
+
+export const SPENDING_CATEGORIES = CATEGORIES.filter(
+  (category): category is SpendingCategory => category !== "income",
+);
+
+export function isCategory(value: unknown): value is Category {
+  return typeof value === "string" && CATEGORIES.includes(value as Category);
+}
+
+export function isSpendingCategory(value: unknown): value is SpendingCategory {
+  return (
+    typeof value === "string" &&
+    SPENDING_CATEGORIES.includes(value as SpendingCategory)
+  );
+}
 
 export interface Transaction {
   id: string;
   description: string;
-  /** Positive for income, negative for spending. */
+  /** Major currency units, normalized to two decimals. Positive means income. */
   amount: number;
   category: Category;
   createdAt: string;
@@ -27,8 +46,19 @@ export interface NewTransactionInput {
 }
 
 export interface Budget {
-  category: Category;
+  category: SpendingCategory;
+  /** Major currency units, normalized to two decimals. */
   limit: number;
+}
+
+export interface Page<T> {
+  data: T[];
+  pagination: {
+    limit: number;
+    offset: number;
+    total: number;
+    hasMore: boolean;
+  };
 }
 
 export interface CategorySummary {

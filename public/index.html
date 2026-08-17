@@ -9,7 +9,7 @@
   <body>
     <header class="topbar">
       <div class="brand">
-        <span class="logo">◈</span>
+        <span class="logo" aria-hidden="true">◈</span>
         <h1>agentic&#8209;money</h1>
       </div>
       <p class="tagline">Your autonomous personal-finance assistant</p>
@@ -34,6 +34,7 @@
       <section class="panel">
         <h2>Add a transaction</h2>
         <form id="txn-form" class="txn-form">
+          <label class="sr-only" for="txn-description">Description</label>
           <input
             id="txn-description"
             name="description"
@@ -42,6 +43,7 @@
             autocomplete="off"
             required
           />
+          <label class="sr-only" for="txn-amount">Amount</label>
           <input
             id="txn-amount"
             name="amount"
@@ -52,10 +54,42 @@
           />
           <button type="submit">Add</button>
         </form>
+        <p id="txn-status" class="form-status" role="status" aria-live="polite"></p>
         <p class="hint">
           Leave the category to the agent — it reads the description and files it
           for you. Use a negative amount for spending, positive for income.
         </p>
+      </section>
+
+      <section class="panel">
+        <h2>Manage budgets</h2>
+        <form id="budget-form" class="budget-form">
+          <label for="budget-category">Category</label>
+          <select id="budget-category" name="category" required>
+            <option value="groceries">Groceries</option>
+            <option value="dining">Dining</option>
+            <option value="transport">Transport</option>
+            <option value="housing">Housing</option>
+            <option value="utilities">Utilities</option>
+            <option value="entertainment">Entertainment</option>
+            <option value="health">Health</option>
+            <option value="shopping">Shopping</option>
+            <option value="other">Other</option>
+          </select>
+          <label for="budget-limit">Monthly limit</label>
+          <input
+            id="budget-limit"
+            name="limit"
+            type="number"
+            min="0"
+            step="0.01"
+            placeholder="0.00"
+            required
+          />
+          <button type="submit">Save budget</button>
+        </form>
+        <p id="budget-status" class="form-status" role="status" aria-live="polite"></p>
+        <ul id="budgets" class="budget-list"></ul>
       </section>
 
       <section class="panel">
@@ -71,7 +105,34 @@
       <section class="panel">
         <h2>Recent transactions</h2>
         <ul id="transactions" class="transactions"></ul>
+        <nav class="transaction-pagination" aria-label="Transaction pages">
+          <button id="transactions-previous" type="button" disabled>Previous</button>
+          <span
+            id="transactions-page"
+            class="transaction-page"
+            role="status"
+            aria-live="polite"
+          >Showing 0 transactions</span>
+          <button id="transactions-next" type="button" disabled>Next</button>
+        </nav>
       </section>
+
+      <section class="panel settings">
+        <h2>Connection settings</h2>
+        <label for="api-token">API token</label>
+        <input
+          id="api-token"
+          type="password"
+          autocomplete="off"
+          aria-describedby="api-token-hint"
+          placeholder="Only needed when configured"
+        />
+        <p id="api-token-hint" class="hint">
+          The token stays only in this page's memory and is cleared on reload.
+        </p>
+      </section>
+
+      <p id="load-status" class="load-status" role="status" aria-live="polite"></p>
     </main>
 
     <script src="./app.js"></script>

@@ -40,6 +40,24 @@ describe("categorize", () => {
   it("falls back to other for unknown spending", () => {
     expect(categorize("Random purchase", -20)).toBe("other");
   });
+
+  it("matches whole keywords rather than substrings", () => {
+    expect(categorize("Shell fuel", -20)).toBe("transport");
+    expect(categorize("Drinks at the bar", -20)).toBe("dining");
+    expect(categorize("Eggshell paint", -20)).toBe("other");
+    expect(categorize("New barbell", -20)).toBe("other");
+  });
+
+  it("uses the amount sign for refunds and other positive credits", () => {
+    expect(categorize("Whole Foods refund", 20)).toBe("income");
+    expect(categorize("Refund reversal", -20)).toBe("other");
+  });
+
+  it("rejects non-finite amounts", () => {
+    expect(() => categorize("Overflow", Number.POSITIVE_INFINITY)).toThrow(
+      /finite/,
+    );
+  });
 });
 
 describe("summarize", () => {
@@ -83,5 +101,40 @@ describe("summarize", () => {
     const summary = summarize([], []);
     expect(summary.insights).toHaveLength(1);
     expect(summary.insights[0].level).toBe("info");
+  });
+
+  it("sums normalized minor units without floating-point drift", () => {
+    const summary = summarize(
+      [
+        txn("First", -0.1, "other"),
+        txn("Second", -0.2, "other"),
+        txn("Income", 0.3, "income"),
+      ],
+      [],
+    );
+
+    expect(summary.spending).toBe(0.3);
+    expect(summary.income).toBe(0.3);
+    expect(summary.net).toBe(0);
+  });
+
+  it("treats spending against a zero limit as over budget", () => {
+    const summary = summarize(
+      [txn("Coffee", -1, "dining")],
+      [{ category: "dining", limit: 0 }],
+    );
+
+    expect(summary.categories[0]).toMatchObject({
+      limit: 0,
+      remaining: -1,
+      utilization: null,
+    });
+    expect(
+      summary.insights.some(
+        (insight) =>
+          insight.level === "danger" &&
+          insight.message.includes("over budget"),
+      ),
+    ).toBe(true);
   });
 });
