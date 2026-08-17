@@ -23,6 +23,7 @@ class Tool:
     description: str
     allow: frozenset[str]
     fn: Callable[..., Any]
+    wants_caller: bool = False
 
     def allows(self, agent: str) -> bool:
         return "*" in self.allow or agent in self.allow
@@ -62,7 +63,13 @@ class Registry:
             world.store.emit("tool_denied", {"tool": name}, caller)
             return ToolResult(False, error=f"denied: {caller} cannot use {name}")
         try:
-            data = tool.fn(world, **kwargs)
+            if tool.wants_caller:
+                # The authenticated caller always wins: a "caller" kwarg smuggled
+                # in by the caller is discarded, never forwarded.
+                kwargs.pop("caller", None)
+                data = tool.fn(world, caller=caller, **kwargs)
+            else:
+                data = tool.fn(world, **kwargs)
             world.store.emit("tool", {"tool": name, "ok": True}, caller)
             return ToolResult(True, data=data)
         except Exception as e:
