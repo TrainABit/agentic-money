@@ -31,29 +31,41 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    world = bootstrap(_config(args))
-    ticks = args.ticks
-    reports = []
-    for i in range(ticks):
-        r = step(world)
-        reports.append(r)
-        if args.verbose or (i + 1) % 5 == 0 or i == ticks - 1:
-            print(
-                f"tick={r['tick']} actions={r['actions']} "
-                f"equity={r['equity']:.2f} revenue={r['revenue']:.2f} "
-                f"trailing={r.get('trailing', 0):.2f} pipeline={r.get('pipeline')}",
-                flush=True,
-            )
-        target = args.until_revenue
-        if target and r.get("trailing", r["revenue"]) >= target:
-            print(f"hit revenue target {target}", flush=True)
-            break
-        if args.mode == "live" and args.ticks >= 10**6:
-            time.sleep(world.config.tick_seconds)
-    Path(args.data_dir).mkdir(parents=True, exist_ok=True)
-    (Path(args.data_dir) / "last_run.json").write_text(json.dumps(reports[-1] if reports else {}, indent=2, default=str))
-    print(json.dumps(world.status()["goals"], indent=2))
-    return 0
+    from sovereign.engine.daemon import FileLock
+
+    cfg = _config(args)
+    lock = FileLock(cfg.paths().lock)
+    try:
+        lock.acquire()
+    except RuntimeError as e:
+        print(str(e))
+        return 1
+    try:
+        world = bootstrap(cfg)
+        ticks = args.ticks
+        reports = []
+        for i in range(ticks):
+            r = step(world)
+            reports.append(r)
+            if args.verbose or (i + 1) % 5 == 0 or i == ticks - 1:
+                print(
+                    f"tick={r['tick']} actions={r['actions']} "
+                    f"equity={r['equity']:.2f} revenue={r['revenue']:.2f} "
+                    f"trailing={r.get('trailing', 0):.2f} pipeline={r.get('pipeline')}",
+                    flush=True,
+                )
+            target = args.until_revenue
+            if target and r.get("trailing", r["revenue"]) >= target:
+                print(f"hit revenue target {target}", flush=True)
+                break
+            if args.mode == "live":
+                time.sleep(world.config.tick_seconds)
+        Path(args.data_dir).mkdir(parents=True, exist_ok=True)
+        (Path(args.data_dir) / "last_run.json").write_text(json.dumps(reports[-1] if reports else {}, indent=2, default=str))
+        print(json.dumps(world.status()["goals"], indent=2))
+        return 0
+    finally:
+        lock.release()
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -97,13 +109,16 @@ def cmd_reply(args: argparse.Namespace) -> int:
     fields = {}
     for pair in args.field:
         k, _, v = pair.partition("=")
+        if v == "-":
+            v = sys.stdin.readline().rstrip("\n")
         fields[k] = v
-    item = world.human.reply(args.request_id, fields)
+    world.human.reply(args.request_id, fields)
     from sovereign.channels.replies import consume
 
     consume(world)
     world.persist_kv()
-    print(json.dumps(item, indent=2))
+    shown = next((i for i in world.human.all() if i["id"] == args.request_id), {"id": args.request_id, "status": "filled"})
+    print(json.dumps(shown, indent=2))
     return 0
 
 
@@ -257,7 +272,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("reply", help="Inject a login/credential (not a work approval)")
     _globals(s)
     s.add_argument("request_id")
-    s.add_argument("field", nargs="+", help="KEY=VALUE")
+    s.add_argument("field", nargs="+", help="KEY=VALUE (use KEY=- to read the value from stdin)")
     s.set_defaults(func=cmd_reply)
 
     s = sub.add_parser("doctor", help="Check subscription CLI, wallet, inbox, engine health")

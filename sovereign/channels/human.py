@@ -59,8 +59,13 @@ class HumanInbox:
                 self._write(items)
                 replies = []
                 if self.paths.human_replies.exists():
-                    replies = json.loads(self.paths.human_replies.read_text())
-                replies.append(it)
+                    try:
+                        replies = json.loads(self.paths.human_replies.read_text())
+                    except Exception:
+                        replies = []
+                log = dict(it)
+                log["reply"] = {k: "[set]" for k in fields}
+                replies.append(log)
                 self.paths.human_replies.write_text(json.dumps(replies, indent=2))
                 return it
         raise KeyError(request_id)

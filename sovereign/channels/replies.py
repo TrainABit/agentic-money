@@ -51,6 +51,7 @@ def consume(world: "World") -> list[dict[str, Any]]:
                 pass
         it["consumed"] = True
         it["consumed_flags"] = flags
+        it["reply"] = {k: "[vaulted]" for k in fields}
         dirty = True
         applied.append({"id": it["id"], "service": service, "flags": flags})
         world.store.emit("human_consumed", {"id": it["id"], "service": service, "flags": flags}, "courier")

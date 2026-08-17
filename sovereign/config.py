@@ -68,6 +68,8 @@ class EngineConfig(BaseModel):
     fetch_market_data: bool = True
     rpc_url: str = "https://ethereum.publicnode.com"
     usdc_token: str = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+    sol_rpc_url: str = "https://api.mainnet-beta.solana.com"
+    sol_usdc_mint: str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
     allow_live_infra_buy: bool = False
     daily_apply_cap: int = 8
 
@@ -87,6 +89,21 @@ class EngineConfig(BaseModel):
         if self.sim.realism:
             return False
         return self.sim.auto_accept
+
+    def price_refresh_every(self) -> int:
+        if self.mode == "sim":
+            return 10**9
+        return max(1, int(3600 / max(self.tick_seconds, 1)))
+
+    def recertify_every(self) -> int:
+        if self.mode == "sim":
+            return 7
+        return max(1, int(7 * 24 * 3600 / max(self.tick_seconds, 1)))
+
+    def apply_cap(self) -> int:
+        if self.mode == "sim":
+            return self.sim.daily_apply_cap
+        return self.daily_apply_cap
 
 
 class Paths:

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -58,9 +60,19 @@ class SimBrain:
         return "sim-brain"
 
 
+def jail_contains(child: Path, root: Path) -> bool:
+    """True iff child is root or a descendant. Rejects prefix tricks like work-evil."""
+    try:
+        Path(child).resolve().relative_to(Path(root).resolve())
+        return True
+    except ValueError:
+        return False
+
+
 class ClaudeCodeProvider:
-    def __init__(self, bin_name: str = "claude") -> None:
+    def __init__(self, bin_name: str = "claude", models: dict[str, str] | None = None) -> None:
         self.bin_name = bin_name
+        self.models = models or {"fast": "haiku", "work": "sonnet", "think": "opus"}
 
     def available(self) -> bool:
         return shutil.which(self.bin_name) is not None
@@ -68,10 +80,12 @@ class ClaudeCodeProvider:
     def name(self) -> str:
         return "claude-code"
 
+    def _model(self, tier: ModelTier) -> str:
+        return self.models.get(tier, {"fast": "haiku", "work": "sonnet", "think": "opus"}[tier])
+
     def complete(self, prompt: str, tier: ModelTier, system: str) -> str:
         if not self.available():
             raise RuntimeError("claude CLI not on PATH")
-        model = {"fast": "haiku", "work": "sonnet", "think": "opus"}[tier]
         full = f"{system.strip()}\n\n{prompt}"
         proc = subprocess.run(
             [
@@ -81,7 +95,7 @@ class ClaudeCodeProvider:
                 "--output-format",
                 "text",
                 "--model",
-                model,
+                self._model(tier),
             ],
             capture_output=True,
             text=True,
@@ -101,11 +115,22 @@ class ClaudeCodeProvider:
     ) -> str:
         resolved = Path(cwd).resolve()
         root = Path(work_root).resolve()
-        if not str(resolved).startswith(str(root)):
+        if not jail_contains(resolved, root):
             raise PermissionError("claude jail escape blocked")
         if not self.available():
             raise RuntimeError("claude CLI not on PATH")
-        model = {"fast": "haiku", "work": "sonnet", "think": "opus"}[tier]
+        settings_dir = resolved / ".claude"
+        settings_dir.mkdir(exist_ok=True)
+        (settings_dir / "settings.json").write_text(
+            json.dumps(
+                {
+                    "permissions": {
+                        "allow": ["Read", "Write", "Edit", "Glob", "Grep"],
+                        "deny": ["Bash", "Agent", "WebFetch", "WebSearch"],
+                    }
+                }
+            )
+        )
         proc = subprocess.run(
             [
                 self.bin_name,
@@ -114,8 +139,13 @@ class ClaudeCodeProvider:
                 "--output-format",
                 "text",
                 "--model",
-                model,
-                "--dangerously-skip-permissions",
+                self._model(tier),
+                "--permission-mode",
+                "dontAsk",
+                "--allowedTools",
+                "Read,Write,Edit,Glob,Grep",
+                "--disallowedTools",
+                "Bash,Agent,WebFetch,WebSearch",
             ],
             capture_output=True,
             text=True,
@@ -131,17 +161,33 @@ class Router:
     def __init__(self, config: EngineConfig) -> None:
         self.config = config
         self.sim = SimBrain()
-        self.claude = ClaudeCodeProvider(config.models.claude_bin)
+        self.claude = ClaudeCodeProvider(
+            config.models.claude_bin,
+            models={"fast": config.models.fast, "work": config.models.work, "think": config.models.think},
+        )
         self.usage = Usage()
+        self.usage_day = ""
+        self.degraded = False
+        self.queued = 0
 
     def provider_name(self) -> str:
+        if self.degraded:
+            return "degraded"
         if self.config.mode == "sim":
             return self.sim.name()
         if self.config.models.provider == "claude_code" and self.claude.available():
             return self.claude.name()
         return self.sim.name()
 
+    def _roll_day(self) -> None:
+        day = datetime.now(timezone.utc).date().isoformat()
+        if self.usage_day != day:
+            self.usage = Usage()
+            self.usage_day = day
+            self.degraded = False
+
     def remaining_budget(self) -> int:
+        self._roll_day()
         return max(0, self.config.models.daily_token_budget - self.usage.tokens)
 
     def complete(
@@ -154,7 +200,10 @@ class Router:
         if tier == "think" and self.usage.tokens > 0.7 * self.config.models.daily_token_budget:
             tier = "work"
         if est > self.remaining_budget():
-            # Degrade: still answer via sim brain so the firm does not stall
+            self.degraded = True
+            self.queued += 1
+            if self.config.mode == "live":
+                return ""
             text = self.sim.complete(prompt, "fast", system)
             self._count("fast", len(text) // 4)
             return text
@@ -164,32 +213,35 @@ class Router:
                 self._count(tier, est + len(text) // 4)
                 return text
             except Exception:
+                self.degraded = True
+                self.queued += 1
                 if not self.config.models.allow_api_fallback:
-                    text = self.sim.complete(prompt, tier, system)
-                    self._count("fast", len(text) // 4)
-                    return text
+                    return ""
                 raise
         text = self.sim.complete(prompt, tier, system)
         self._count("fast", len(text) // 4)
         return text
 
     def complete_in_dir(self, prompt: str, cwd: Path, work_root: Path, tier: ModelTier = "work") -> str:
-        if self.config.mode == "live" and self.claude.available():
+        if self.config.mode == "live" and self.claude.available() and not self.degraded:
             try:
                 text = self.claude.complete_in_dir(prompt, cwd, work_root, tier=tier)
                 self._count(tier, max(32, len(prompt) // 4 + 256))
                 return text
             except Exception:
+                self.degraded = True
                 return self.sim.complete(prompt, tier, "jailed crafter")
         return self.sim.complete(prompt, tier, "jailed crafter")
 
     def _count(self, tier: str, tokens: int) -> None:
+        self._roll_day()
         self.usage.tokens += tokens
         self.usage.calls += 1
         assert self.usage.by_tier is not None
         self.usage.by_tier[tier] = self.usage.by_tier.get(tier, 0) + tokens
 
     def snapshot(self) -> dict[str, Any]:
+        self._roll_day()
         return {
             "provider": self.provider_name(),
             "tokens": self.usage.tokens,
@@ -197,4 +249,17 @@ class Router:
             "by_tier": self.usage.by_tier,
             "budget": self.config.models.daily_token_budget,
             "claude_cli": self.claude.available(),
+            "usage_day": self.usage_day,
+            "degraded": self.degraded,
+            "queued": self.queued,
         }
+
+    def restore(self, snap: dict[str, Any]) -> None:
+        self.usage_day = str(snap.get("usage_day") or "")
+        self.degraded = bool(snap.get("degraded"))
+        self.queued = int(snap.get("queued") or 0)
+        self.usage.tokens = int(snap.get("tokens") or 0)
+        self.usage.calls = int(snap.get("calls") or 0)
+        if snap.get("by_tier"):
+            self.usage.by_tier = dict(snap["by_tier"])
+        self._roll_day()
