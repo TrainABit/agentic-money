@@ -453,7 +453,7 @@ def test_sim_rejection_uses_pipeline_transition(tmp_path):
     world = bootstrap(config, heal=False)
     world.store.upsert_job(
         {
-            "id": "job_sim_reject1",
+            "id": "job_simreject1",
             "source": "sim-market",
             "title": "Reject through pipeline",
             "description": "Python automation",
@@ -464,7 +464,7 @@ def test_sim_rejection_uses_pipeline_transition(tmp_path):
     )
 
     closer(world)
-    rejected = world.store.get_job("job_sim_reject1")
+    rejected = world.store.get_job("job_simreject1")
     assert rejected["status"] == "rejected"
     assert rejected["rejected_via"] == "sim"
     matching = [
