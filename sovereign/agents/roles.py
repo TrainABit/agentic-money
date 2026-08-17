@@ -19,8 +19,34 @@ from sovereign.markets.strategies import STRATEGIES
 from sovereign.plays import PLAYS, attention_map, play_roi
 
 
+def mechanic(world: World) -> list[dict[str, Any]]:
+    """Self-heal. Runs first. Other agents keep working even if a login is missing."""
+    if world.tools is None:
+        from sovereign.tools.catalog import build_registry
+
+        world.tools = build_registry()
+        world.tools.bind(world)
+    full = world.tick % 10 == 0
+    report = world.use_tool("mechanic", "heal.repair", full=full)
+    data = report.data if report.ok else {"error": report.error}
+    from sovereign.heal.repair import thaw_cooled
+
+    thawed = thaw_cooled(world, cooldown=5)
+    if world.tick > 0 and not any(c.get("certified") for c in world.certified):
+        world.use_tool("mechanic", "market.certify")
+    return [
+        {
+            "kind": "mechanic",
+            "health": data,
+            "thawed": thawed,
+            "tools": world.tools.available_to("mechanic") if world.tools else [],
+        }
+    ]
+
+
 def bookkeeper(world: World) -> list[dict[str, Any]]:
-    snap = world.ledger.snapshot(now=world.now)
+    r = world.use_tool("bookkeeper", "ledger.snapshot")
+    snap = r.data if r.ok else world.ledger.snapshot(now=world.now)
     world.store.set_kv("last_snapshot", snap)
     return [
         {
@@ -36,11 +62,13 @@ def risk(world: World) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     halt = world.broker.maybe_halt(world.config.risk)
     if halt:
-        world.frozen.add("trader")
+        world.freeze("trader", halt)
         out.append({"kind": "circuit_break", "reason": halt, "broker": world.broker.snapshot()})
     for agent, score in list(world.reputation.scores.items()):
-        if score < 20:
-            world.frozen.add(agent)
+        if score < 20 and agent not in world.frozen:
+            fr = world.use_tool("risk", "governance.freeze", agent=agent, reason=f"rep {score}")
+            if not fr.ok:
+                world.freeze(agent, f"rep {score}")
             out.append({"kind": "rep_freeze", "agent": agent, "score": score})
     if world.config.risk.operating_cash_is_tradable:
         world.config.risk.operating_cash_is_tradable = False
@@ -55,7 +83,7 @@ def ethics(world: World) -> list[dict[str, Any]]:
         blob = json.dumps(ev).lower()
         if any(s in blob for s in ("mnemonic", "sol_secret", "eth_key", "smtp_pass")):
             world.reputation.slash("operator", 50, "secret leakage")
-            world.frozen.add("operator")
+            world.use_tool("ethics", "governance.freeze", agent="operator", reason="secret leakage")
             notes.append("secret_leak")
     applies = len(world.store.jobs("applied"))
     accepts = len(world.store.jobs("accepted")) + len(world.store.jobs("paid")) + len(world.store.jobs("invoiced"))
@@ -89,7 +117,10 @@ def director(world: World) -> list[dict[str, Any]]:
 
 def hunter(world: World) -> list[dict[str, Any]]:
     live = world.config.mode == "live" and world.config.public_job_apis
-    found = world.board.search(tick=world.tick, live=live, include_sim=world.config.mode == "sim")
+    found_r = world.use_tool("hunter", "jobs.search", live=live)
+    found = found_r.data if found_r.ok and isinstance(found_r.data, list) else None
+    if found is None:
+        found = world.board.search(tick=world.tick, live=live, include_sim=world.config.mode == "sim")
     taken = 0
     picked = []
     existing = {j["id"] for j in world.store.jobs()}
@@ -101,17 +132,21 @@ def hunter(world: World) -> list[dict[str, Any]]:
         job["status"] = "open"
         if not job.get("price_usd"):
             job["price_usd"] = quote_usd(job)
-        world.store.upsert_job(job)
+        up = world.use_tool("hunter", "jobs.upsert", job=job)
+        if not up.ok:
+            world.store.upsert_job(job)
         picked.append(job["title"])
         taken += 1
         if taken >= 4:
             break
     if live and taken == 0:
-        world.human.ask(
-            "job-platforms",
-            "Optional: Upwork/Fiverr tokens. Public boards already run. Or drop inbound leads as JSON in data/mail/inbox/.",
-            ["note"],
-            "Extra channels. Not required to earn.",
+        world.use_tool(
+            "hunter",
+            "human.ask",
+            service="job-platforms",
+            instruction="Optional: Upwork/Fiverr tokens. Public boards already run. Or drop inbound leads as JSON in data/mail/inbox/.",
+            fields=["note"],
+            why="Extra channels. Not required to earn.",
         )
     return [{"kind": "hunt", "new": taken, "titles": picked}]
 
@@ -126,22 +161,38 @@ def closer(world: World) -> list[dict[str, Any]]:
     rate = world.config.sim.close_rate if world.config.mode == "sim" else 1.0
     for job in open_jobs[:budget]:
         job["price_usd"] = quote_usd(job)
-        blurb = world.router.complete(
-            f"Write a short proposal for: {job.get('title')}\n{job.get('description','')}\n"
-            f"Playbook:\n{playbook(world, 'closer')}",
+        pb = playbook(world, "closer", job["id"])
+        blurb = world.use_tool(
+            "closer",
+            "brain.complete",
+            prompt=f"Write a short proposal for: {job.get('title')}\n{job.get('description','')}\nPlaybook:\n{pb}",
             tier="work",
+            system=pb,
         )
-        text = proposal_text(job, world.config.firm_name, blurb)
+        blurb_text = blurb.data if blurb.ok else str(blurb.error or "")
+        text = proposal_text(job, world.config.firm_name, blurb_text)
         job["proposal"] = text
+        trial_p = world.config.paths().playbooks / "closer.trial.md"
+        job["ab_variant"] = "trial" if trial_p.exists() and pb == trial_p.read_text() else "control"
         to = job.get("contact") or job.get("email") or "client@unknown.local"
-        mailbox.send(
-            world,
+        sent = world.use_tool(
+            "closer",
+            "mail.send",
             to=to,
             subject=f"Proposal: {job.get('title')} [{job['id']}]",
             body=text,
             job_id=job["id"],
             kind="proposal",
         )
+        if not sent.ok:
+            mailbox.send(
+                world,
+                to=to,
+                subject=f"Proposal: {job.get('title')} [{job['id']}]",
+                body=text,
+                job_id=job["id"],
+                kind="proposal",
+            )
         if world.config.auto_accept():
             if sim_client_accepts(job, text, close_rate=rate):
                 accept_job(world, job["id"], source="sim")
@@ -165,7 +216,10 @@ def crafter(world: World) -> list[dict[str, Any]]:
     job = queue[0]
     job["status"] = "in_progress"
     world.store.upsert_job(job)
-    artifact = produce(world, job)
+    produced = world.use_tool("crafter", "craft.produce", job=job)
+    artifact = produced.data if produced.ok else produce(world, job)
+    if not isinstance(artifact, dict) or not artifact.get("delivery"):
+        return [{"kind": "craft", "error": getattr(produced, "error", None) or "no artifact"}]
     job["status"] = "delivered"
     job["delivery_path"] = artifact["delivery"]
     job["entry"] = artifact.get("entry")
@@ -173,6 +227,9 @@ def crafter(world: World) -> list[dict[str, Any]]:
     world.store.upsert_job(job)
     world.store.outcome("delivery", float(job.get("price_usd") or 0), True, job["title"], "crafter", "labor_studio")
     world.reputation.boost("crafter", 2.0, "delivered")
+    from sovereign.memory.skills import record
+
+    record(world, "crafter.deliver", True, float(job.get("price_usd") or 0))
     mailbox.send(
         world,
         to=job.get("contact") or "client@unknown.local",
@@ -190,7 +247,10 @@ def treasurer(world: World) -> list[dict[str, Any]]:
         income = "income.products" if job.get("source") == "product" else "income.labor"
         if "retainer" in str(job.get("title", "")).lower():
             income = "income.retainers"
-        inv = invoices.issue(world, job, income_account=income)
+        inv_r = world.use_tool("treasurer", "invoice.issue", job=job, income_account=income)
+        inv = inv_r.data if inv_r.ok else invoices.issue(world, job, income_account=income)
+        if not isinstance(inv, dict):
+            continue
         issued.append(inv["id"])
         mailbox.send(
             world,
@@ -207,7 +267,8 @@ def treasurer(world: World) -> list[dict[str, Any]]:
         for inv in world.store.invoices("open"):
             issued_tick = int(inv.get("issued_tick") or 0)
             if world.tick - issued_tick >= delay:
-                collected.append(invoices.collect(world, inv["id"], source="autocollect"))
+                got = world.use_tool("treasurer", "invoice.collect", ref=inv["id"], source="autocollect")
+                collected.append(got.data if got.ok else invoices.collect(world, inv["id"], source="autocollect"))
     else:
         collected.extend(watch_and_collect(world))
 
@@ -432,32 +493,49 @@ def auditor(world: World) -> list[dict[str, Any]]:
 def improver(world: World) -> list[dict[str, Any]]:
     if world.tick % 7 != 0:
         return []
+    from sovereign.memory.playbooks import promote_trial, revert_trial
+    from sovereign.memory.skills import record
+
     outcomes = world.store.outcomes(40)
     wins = sum(1 for o in outcomes if o["success"])
     n = len(outcomes) or 1
     roi = play_roi(outcomes)
-    patch = world.router.complete(
-        f"Outcomes winrate={wins}/{n} roi={roi}. Write a playbook patch for closer and hunter.",
-        tier="work",
-        system=playbook(world, "improver"),
-    )
-    trial = world.config.paths().playbooks / "closer.trial.md"
-    trial.write_text(patch)
+    record(world, "improver.cycle", True, 0)
+    ab = dict(world.store.get_kv("ab_closer") or {})
+    trial_p = world.config.paths().playbooks / "closer.trial.md"
     promoted = False
-    if wins / n >= 0.4:
-        (world.config.paths().playbooks / "closer.md").write_text(
-            playbook(world, "closer") + "\n\n## Improver patch\n" + patch + "\n"
+    reverted = False
+    tn, cn = int(ab.get("trial_n", 0)), int(ab.get("control_n", 0))
+    tw, cw = float(ab.get("trial_usd", 0)), float(ab.get("control_usd", 0))
+    if trial_p.exists() and tn >= 6 and cn >= 6:
+        t_avg = tw / max(tn, 1)
+        c_avg = cw / max(cn, 1)
+        if t_avg > c_avg * 1.05:
+            promoted = promote_trial(world.config.paths().playbooks, "closer")
+            world.store.outcome("playbook", 0, True, "promoted closer trial", "improver", "labor_studio")
+        else:
+            reverted = revert_trial(world.config.paths().playbooks, "closer")
+            world.store.outcome("playbook", 0, False, "reverted closer trial", "improver", "labor_studio")
+        world.store.set_kv("ab_closer", {"control_n": 0, "trial_n": 0, "control_usd": 0.0, "trial_usd": 0.0})
+    elif not trial_p.exists():
+        patch = world.use_tool(
+            "improver",
+            "brain.complete",
+            prompt=f"Outcomes winrate={wins}/{n} roi={roi} ab={ab}. Write a closer playbook trial.",
+            tier="work",
+            system=playbook(world, "improver"),
         )
-        promoted = True
-        world.store.outcome("playbook", 0, True, "promoted closer patch", "improver", "labor_studio")
-    # Starve zero-EV plays in override
+        body = patch.data if patch.ok else (
+            "# Closer trial\n- Name their stack in line 1.\n- Fixed price + USDC + 48h + kill-scope.\n"
+        )
+        world.use_tool("improver", "playbook.write_trial", agent="closer", body=str(body))
     override = world.store.get_kv("attention_override") or {}
     for p in PLAYS:
         if roi.get(p.id, 0) <= 0 and world.tick > 14:
             override[p.id] = max(0.01, attention_map(0, 2000, 5000).get(p.id, 0.05) * 0.5)
     if override:
         world.store.set_kv("attention_override", override)
-    return [{"kind": "improve", "winrate": round(wins / n, 3), "promoted": promoted, "roi": roi}]
+    return [{"kind": "improve", "winrate": round(wins / n, 3), "promoted": promoted, "reverted": reverted, "roi": roi, "ab": ab}]
 
 
 def courier(world: World) -> list[dict[str, Any]]:

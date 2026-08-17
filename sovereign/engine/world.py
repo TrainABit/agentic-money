@@ -40,11 +40,30 @@ class World:
     identity: dict[str, str] = field(default_factory=dict)
     market_close: list[float] = field(default_factory=list)
     last_prices: dict[str, float] = field(default_factory=dict)
+    freeze_since: dict[str, int] = field(default_factory=dict)
+    tools: Any = None
 
     def stamp(self) -> str:
         if self.config.mode == "live":
             return iso()
         return iso(self.now)
+
+    def freeze(self, agent: str, reason: str) -> None:
+        first = agent not in self.frozen
+        self.frozen.add(agent)
+        if first:
+            self.freeze_since[agent] = self.tick
+            self.store.emit("freeze", {"agent": agent, "reason": reason}, "risk")
+
+    def thaw(self, agent: str, reason: str) -> None:
+        self.frozen.discard(agent)
+        self.freeze_since.pop(agent, None)
+        self.store.emit("thaw", {"agent": agent, "reason": reason}, "mechanic")
+
+    def use_tool(self, agent: str, name: str, **kwargs: Any) -> Any:
+        if self.tools is None:
+            raise RuntimeError("tools unbound")
+        return self.tools.call(agent, name, **kwargs)
 
     def persist_kv(self) -> None:
         self.store.set_kv(
@@ -59,6 +78,7 @@ class World:
                 "broker": self.broker.snapshot(),
                 "last_prices": self.last_prices,
                 "provider": self.router.snapshot(),
+                "freeze_since": self.freeze_since,
             },
         )
 
@@ -79,6 +99,7 @@ class World:
             self.broker.last_price = float(b.get("last_price", 0))
             self.broker.frozen = bool(b.get("frozen", False))
         self.last_prices = dict(meta.get("last_prices") or {})
+        self.freeze_since = {k: int(v) for k, v in (meta.get("freeze_since") or {}).items()}
 
     def status(self) -> dict[str, Any]:
         snap = self.ledger.snapshot(now=self.now)
@@ -122,6 +143,16 @@ class World:
             "cognition": self.router.snapshot(),
             "recent_events": self.store.events(25),
             "missions": self.store.missions(),
+            "health": self.store.get_kv("health"),
+            "skills": self.store.get_kv("skills"),
+            "tools": None if self.tools is None else {
+                "names": self.tools.names(),
+                "by_agent": {a: self.tools.available_to(a) for a in (
+                    "hunter", "closer", "crafter", "trader", "treasurer",
+                    "mechanic", "improver", "courier", "director", "risk",
+                    "bookkeeper", "ethics", "auditor", "operator", "publisher", "scout",
+                )},
+            },
         }
 
 
@@ -155,6 +186,10 @@ def bootstrap(config: EngineConfig) -> World:
             "born": iso(),
         },
     )
+    from sovereign.tools.catalog import build_registry
+
+    world.tools = build_registry()
+    world.tools.bind(world)
     if store.get_kv("meta"):
         world.load_kv()
         world.identity.setdefault("name", config.firm_name)
@@ -194,6 +229,9 @@ def bootstrap(config: EngineConfig) -> World:
             f"- Expected volume: ${config.goals.minimum_usd:.0f}–${config.goals.good_usd:.0f}/mo.\n"
             f"- Operators: autonomous agents under the human legal person.\n"
         )
+    from sovereign.heal.repair import setup as heal_setup
+
+    heal_setup(world, full=False)
     world.persist_kv()
     return world
 

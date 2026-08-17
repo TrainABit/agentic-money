@@ -14,9 +14,19 @@ def accept_job(world: "World", job_id: str, source: str = "manual") -> dict[str,
         return job
     job["status"] = "accepted"
     job["accepted_via"] = source
+    variant = job.get("ab_variant")
+    if variant in {"trial", "control"}:
+        ab = dict(world.store.get_kv("ab_closer") or {})
+        key = f"{variant}_usd"
+        ab[key] = float(ab.get(key, 0)) + float(job.get("price_usd") or 0)
+        ab[f"{variant}_wins"] = int(ab.get(f"{variant}_wins", 0)) + 1
+        world.store.set_kv("ab_closer", ab)
     world.store.upsert_job(job)
     world.store.outcome("proposal", float(job.get("price_usd") or 0), True, job.get("title", ""), "closer", "labor_studio")
     world.reputation.boost("closer", 1.5, f"accepted via {source}")
+    from sovereign.memory.skills import record
+
+    record(world, "closer.accept", True, float(job.get("price_usd") or 0))
     return job
 
 

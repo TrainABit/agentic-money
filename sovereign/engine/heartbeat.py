@@ -4,7 +4,6 @@ import uuid
 from typing import Any, Callable
 
 from sovereign.engine.world import World, ensure_certified, load_prices
-from sovereign.memory.playbooks import read_playbook
 from sovereign.memory.store import iso
 from sovereign.plays import PLAYS, attention_map, play_roi
 from datetime import timedelta
@@ -54,6 +53,7 @@ def step(world: World) -> dict[str, Any]:
     from sovereign.agents import roles
 
     pipeline = [
+        roles.mechanic,
         roles.bookkeeper,
         roles.risk,
         roles.ethics,
@@ -81,7 +81,7 @@ def step(world: World) -> dict[str, Any]:
             world.store.emit("agent_error", {"error": str(e)}, name)
             world.reputation.slash(name, 5, f"exception: {e}")
             if world.reputation.should_freeze(name):
-                world.frozen.add(name)
+                world.freeze(name, f"exception: {e}")
             continue
         actions.extend(produced)
         for a in produced:
@@ -135,5 +135,7 @@ def fund_missions(world: World) -> list[dict[str, Any]]:
     return created
 
 
-def playbook(world: World, agent: str) -> str:
-    return read_playbook(world.config.paths().playbooks, agent)
+def playbook(world: World, agent: str, job_id: str | None = None) -> str:
+    from sovereign.memory.playbooks import read_playbook_ab
+
+    return read_playbook_ab(world, agent, job_id)

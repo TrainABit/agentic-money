@@ -52,11 +52,23 @@ def serve(config: EngineConfig, ticks: int = 0, verbose: bool = False) -> None:
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
     world = bootstrap(config)
+    from sovereign.heal.repair import setup as heal_setup
+
+    heal_setup(world, full=True)
     n = 0
     log.info("daemon start mode=%s pid=%s", config.mode, os.getpid())
     try:
         while not stop["flag"]:
-            r = step(world)
+            try:
+                r = step(world)
+            except Exception:
+                log.exception("tick crashed; healing")
+                try:
+                    heal_setup(world, full=True)
+                except Exception:
+                    log.exception("heal failed")
+                time.sleep(1.0)
+                continue
             n += 1
             log.info(
                 "tick=%s equity=%.2f trailing=%.2f frozen=%s",
