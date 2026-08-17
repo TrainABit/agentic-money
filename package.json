@@ -5,29 +5,36 @@
   "description": "An agentic personal-finance assistant that categorizes transactions and gives budget advice.",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.13"
   },
   "scripts": {
     "dev": "tsx watch src/server.ts",
-    "build": "tsc -p tsconfig.json",
+    "clean": "node scripts/clean.mjs",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
     "start": "node dist/server.js",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json",
     "lint": "eslint .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "smoke": "node scripts/production-smoke.mjs"
   },
   "dependencies": {
-    "express": "^4.19.2"
+    "better-sqlite3": "^13.0.3",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.6.2",
+    "helmet": "^8.3.0"
   },
   "devDependencies": {
-    "@eslint/js": "^9.9.0",
-    "@types/express": "^4.17.21",
-    "@types/node": "^22.5.0",
-    "@types/supertest": "^6.0.2",
-    "eslint": "^9.9.0",
-    "supertest": "^7.0.0",
-    "tsx": "^4.19.0",
-    "typescript": "^5.5.4",
-    "typescript-eslint": "^8.2.0",
-    "vitest": "^2.0.5"
+    "@eslint/js": "^10.0.1",
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.20.1",
+    "@types/supertest": "^7.2.1",
+    "eslint": "^10.8.1",
+    "globals": "^17.11.0",
+    "supertest": "^7.2.2",
+    "tsx": "^4.23.12",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.67.0",
+    "vitest": "^4.1.10"
   }
 }

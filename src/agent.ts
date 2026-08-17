@@ -3,17 +3,18 @@ import type {
   Category,
   CategorySummary,
   Insight,
+  SpendingCategory,
   Summary,
   Transaction,
 } from "./types.js";
+import { fromMinorUnits, toMinorUnits } from "./money.js";
 
 /**
  * Keyword rules the agent uses to infer a category from a free-text
  * description. Ordering matters: the first category with a matching keyword
  * wins, so more specific categories are listed before generic ones.
  */
-const CATEGORY_KEYWORDS: Array<[Category, string[]]> = [
-  ["income", ["salary", "paycheck", "payroll", "deposit", "refund", "dividend", "invoice paid"]],
+const CATEGORY_KEYWORDS: Array<[SpendingCategory, string[]]> = [
   ["groceries", ["grocery", "groceries", "supermarket", "whole foods", "trader joe", "aldi", "costco"]],
   ["dining", ["restaurant", "cafe", "coffee", "starbucks", "mcdonald", "pizza", "dining", "bar", "takeout", "uber eats", "doordash"]],
   ["transport", ["uber", "lyft", "taxi", "gas", "fuel", "shell", "chevron", "metro", "subway pass", "parking", "flight", "airline"]],
@@ -24,21 +25,35 @@ const CATEGORY_KEYWORDS: Array<[Category, string[]]> = [
   ["shopping", ["amazon", "target", "walmart", "clothing", "shoes", "apple store", "best buy", "shopping"]],
 ];
 
+const CATEGORY_PATTERNS = CATEGORY_KEYWORDS.map(
+  ([category, keywords]) =>
+    [
+      category,
+      keywords.map(
+        (keyword) =>
+          new RegExp(
+            `(?:^|[^\\p{L}\\p{N}])${escapeRegExp(keyword)}(?:$|[^\\p{L}\\p{N}])`,
+            "iu",
+          ),
+      ),
+    ] as const,
+);
+
 /**
  * Infer a spending/income category from a transaction's description and amount.
- * A positive amount with no clear expense keyword is treated as income.
+ * The amount sign takes precedence: every positive amount is income, including
+ * refunds, while negative amounts can only be assigned spending categories.
  */
 export function categorize(description: string, amount: number): Category {
-  const text = description.toLowerCase();
+  if (!Number.isFinite(amount)) {
+    throw new RangeError("amount must be a finite number");
+  }
+  if (amount > 0) return "income";
 
-  for (const [category, keywords] of CATEGORY_KEYWORDS) {
-    if (keywords.some((keyword) => text.includes(keyword))) {
+  for (const [category, patterns] of CATEGORY_PATTERNS) {
+    if (patterns.some((pattern) => pattern.test(description))) {
       return category;
     }
-  }
-
-  if (amount > 0) {
-    return "income";
   }
 
   return "other";
@@ -53,27 +68,39 @@ export function summarize(
   transactions: Transaction[],
   budgets: Budget[],
 ): Summary {
-  const income = transactions
-    .filter((t) => t.amount > 0)
-    .reduce((sum, t) => sum + t.amount, 0);
+  const incomeMinor = transactions
+    .filter((transaction) => transaction.amount > 0)
+    .reduce(
+      (sum, transaction) =>
+        sum + toMinorUnits(transaction.amount, "transaction amount"),
+      0,
+    );
 
-  const spending = transactions
-    .filter((t) => t.amount < 0)
-    .reduce((sum, t) => sum + Math.abs(t.amount), 0);
+  const spendingMinor = transactions
+    .filter((transaction) => transaction.amount < 0)
+    .reduce(
+      (sum, transaction) =>
+        sum + Math.abs(toMinorUnits(transaction.amount, "transaction amount")),
+      0,
+    );
 
   const spentByCategory = new Map<Category, number>();
-  for (const t of transactions) {
-    if (t.amount < 0) {
+  for (const transaction of transactions) {
+    if (transaction.amount < 0) {
       spentByCategory.set(
-        t.category,
-        (spentByCategory.get(t.category) ?? 0) + Math.abs(t.amount),
+        transaction.category,
+        (spentByCategory.get(transaction.category) ?? 0) +
+          Math.abs(toMinorUnits(transaction.amount, "transaction amount")),
       );
     }
   }
 
   const budgetByCategory = new Map<Category, number>();
-  for (const b of budgets) {
-    budgetByCategory.set(b.category, b.limit);
+  for (const budget of budgets) {
+    budgetByCategory.set(
+      budget.category,
+      toMinorUnits(budget.limit, "budget limit"),
+    );
   }
 
   const categoryNames = new Set<Category>([
@@ -83,22 +110,30 @@ export function summarize(
 
   const categories: CategorySummary[] = [...categoryNames]
     .map((category) => {
-      const spent = round(spentByCategory.get(category) ?? 0);
-      const limit = budgetByCategory.has(category)
+      const spentMinor = spentByCategory.get(category) ?? 0;
+      const limitMinor = budgetByCategory.has(category)
         ? budgetByCategory.get(category)!
         : null;
-      const remaining = limit === null ? null : round(limit - spent);
-      const utilization = limit && limit > 0 ? round(spent / limit) : null;
+      const spent = fromMinorUnits(spentMinor);
+      const limit = limitMinor === null ? null : fromMinorUnits(limitMinor);
+      const remaining =
+        limitMinor === null ? null : fromMinorUnits(limitMinor - spentMinor);
+      const utilization =
+        limitMinor !== null && limitMinor > 0
+          ? round(spentMinor / limitMinor)
+          : null;
       return { category, spent, limit, remaining, utilization };
     })
     .sort((a, b) => b.spent - a.spent);
 
+  const income = fromMinorUnits(incomeMinor);
+  const spending = fromMinorUnits(spendingMinor);
   return {
-    income: round(income),
-    spending: round(spending),
-    net: round(income - spending),
+    income,
+    spending,
+    net: fromMinorUnits(incomeMinor - spendingMinor),
     categories,
-    insights: buildInsights(round(income), round(spending), categories),
+    insights: buildInsights(income, spending, categories),
   };
 }
 
@@ -131,6 +166,13 @@ function buildInsights(
   }
 
   for (const c of categories) {
+    if (c.limit === 0 && c.spent > 0) {
+      insights.push({
+        level: "danger",
+        message: `${label(c.category)} is over budget: ${formatMoney(c.spent)} spent of a ${formatMoney(c.limit)} limit.`,
+      });
+      continue;
+    }
     if (c.utilization === null || c.limit === null) continue;
     if (c.utilization >= 1) {
       insights.push({
@@ -167,4 +209,8 @@ function formatMoney(value: number): string {
 
 function round(value: number): number {
   return Math.round(value * 100) / 100;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
