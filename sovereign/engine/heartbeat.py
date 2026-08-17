@@ -4,9 +4,7 @@ import uuid
 from typing import Any, Callable
 
 from sovereign.engine.world import World, ensure_certified, load_prices
-from sovereign.memory.store import iso
 from sovereign.plays import PLAYS, attention_map, play_roi
-from datetime import timedelta
 
 
 AgentFn = Callable[[World], list[dict[str, Any]]]
@@ -17,13 +15,7 @@ def _mid() -> str:
 
 
 def step(world: World) -> dict[str, Any]:
-    world.tick += 1
-    if world.config.mode == "sim":
-        world.now = world.now + timedelta(hours=world.config.tick_hours)
-    else:
-        from sovereign.memory.store import utcnow
-
-        world.now = utcnow()
+    world.start_tick()
     load_prices(world)
     ensure_certified(world)
 
@@ -35,6 +27,9 @@ def step(world: World) -> dict[str, Any]:
     for msg in mailbox.ingest_dropins(world):
         parsed = mailbox.interpret(msg)
         if not parsed:
+            msg["status"] = "ignored"
+            msg["processing_error"] = "no valid job reference"
+            world.store.upsert_mail(msg)
             continue
         try:
             if parsed["action"] == "accept":
@@ -43,8 +38,11 @@ def step(world: World) -> dict[str, Any]:
                 reject_job(world, parsed["job_id"], source="mail")
             elif parsed["action"] in {"paid", "paid_claim"}:
                 world.store.emit("mail_paid_ignored", {"job_id": parsed["job_id"]}, "courier")
-        except KeyError:
-            pass
+        except (KeyError, ValueError) as exc:
+            msg["status"] = "error"
+            msg["processing_error"] = str(exc)[:200]
+            world.store.upsert_mail(msg)
+            continue
         msg["status"] = "read"
         world.store.upsert_mail(msg)
 
@@ -80,13 +78,14 @@ def step(world: World) -> dict[str, Any]:
             world.store.emit("agent_error", {"error": str(e)}, name)
             world.reputation.slash(name, 5, f"exception: {e}")
             if world.reputation.should_freeze(name):
-                world.freeze(name, f"exception: {e}")
+                world.freeze(name, f"exception: {e}", kind="runtime")
             continue
         actions.extend(produced)
         for a in produced:
             world.store.emit(a.get("kind", "action"), a, name)
 
     world.persist_kv()
+    world.finish_tick()
     snap = world.ledger.snapshot(now=world.now)
     return {
         "tick": world.tick,
@@ -126,7 +125,7 @@ def fund_missions(world: World) -> list[dict[str, Any]]:
                 "title": f"{play.title} / {agent}",
                 "status": "active",
                 "budget_usd": round(50 * share * 10, 2),
-                "created_ts": iso(),
+                "created_ts": world.stamp(),
                 "attention": share,
             }
             world.store.upsert_mission(mission)

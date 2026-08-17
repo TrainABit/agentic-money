@@ -50,6 +50,27 @@ class SimConfig(BaseModel):
     daily_apply_cap: int = 8
 
 
+class LiveTiming(BaseModel):
+    """Wall-clock lifecycle limits and bounded live cadences."""
+
+    proposal_expiry_days: float = 14.0
+    invoice_void_days: float = 90.0
+    broker_cooldown_hours: float = 24.0
+    agent_freeze_cooldown_hours: float = 24.0
+    director_cadence_hours: float = 7 * 24.0
+    improver_cadence_hours: float = 7 * 24.0
+    publisher_cadence_hours: float = 24.0
+    scout_cadence_hours: float = 24.0
+    auditor_cadence_hours: float = 1.0
+    full_heal_cadence_hours: float = 1.0
+    price_refresh_hours: float = 1.0
+    price_failure_retry_minutes: float = 5.0
+    recertify_hours: float = 7 * 24.0
+    certification_retry_hours: float = 1.0
+    certification_failure_retry_minutes: float = 15.0
+    craft_retry_hours: float = 1.0
+
+
 class EngineConfig(BaseModel):
     mode: Mode = "sim"
     data_dir: Path = Field(default_factory=lambda: Path("data"))
@@ -59,6 +80,7 @@ class EngineConfig(BaseModel):
     risk: RiskLimits = Field(default_factory=RiskLimits)
     models: ModelConfig = Field(default_factory=ModelConfig)
     sim: SimConfig = Field(default_factory=SimConfig)
+    live_timing: LiveTiming = Field(default_factory=LiveTiming)
     firm_name: str = "Northline Autonomous"
     mandate: str = (
         "Act in the operator's commercial name. Earn, deliver, collect, compound. "

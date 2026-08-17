@@ -1,20 +1,19 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from sovereign.capital import invoice as invoices
 from sovereign.capital.invoice import quote_usd
 from sovereign.capital.payments import watch_and_collect
-from sovereign.channels import mail as mailbox
 from sovereign.engine.heartbeat import fund_missions, playbook
+from sovereign.engine.schedule import elapsed_days
 from sovereign.engine.world import World
 from sovereign.labor.boards import proposal_text, sim_client_accepts
-from sovereign.labor.craft import produce
-from sovereign.labor.pipeline import accept_job
+from sovereign.labor.pipeline import accept_job, reject_job
 from sovereign.markets.strategies import STRATEGIES
 from sovereign.plays import PLAYS, attention_map, play_roi
 
@@ -26,19 +25,55 @@ def mechanic(world: World) -> list[dict[str, Any]]:
 
         world.tools = build_registry()
         world.tools.bind(world)
-    full = world.tick % 10 == 0
+    full = world.scheduler.claim(
+        "mechanic_full",
+        now=world.now,
+        tick=world.tick,
+        sim_every_ticks=10,
+        live_every=timedelta(hours=world.config.live_timing.full_heal_cadence_hours),
+    )
     report = world.use_tool("mechanic", "heal.repair", full=full)
     data = report.data if report.ok else {"error": report.error}
-    from sovereign.heal.repair import thaw_cooled
 
-    thawed = thaw_cooled(world, cooldown=5)
-    if world.tick > 0 and not any(c.get("certified") for c in world.certified):
-        world.use_tool("mechanic", "market.certify")
+    if world.config.mode == "sim":
+        from sovereign.heal.repair import thaw_cooled
+
+        thawed = thaw_cooled(world, cooldown=5)
+    else:
+        thawed = []
+        for agent in list(world.frozen):
+            if not world.freeze_cooldown_elapsed(
+                agent,
+                sim_ticks=5,
+                live_hours=world.config.live_timing.agent_freeze_cooldown_hours,
+            ):
+                continue
+            world.reputation.boost(agent, 12, "mechanic cooldown")
+            if not world.reputation.should_freeze(agent) and world.thaw(
+                agent,
+                "cooldown",
+                automatic=True,
+            ):
+                thawed.append(agent)
+            elif world.reputation.should_freeze(agent):
+                world.freeze_since[agent] = world.tick
+                world.freeze_info[agent]["since_tick"] = world.tick
+                world.freeze_info[agent]["since_ts"] = world.stamp()
+    cert_error = None
+    if (
+        world.config.mode == "sim"
+        and world.tick > 0
+        and not any(c.get("certified") for c in world.certified)
+    ):
+        cert = world.use_tool("mechanic", "market.certify")
+        if not cert.ok:
+            cert_error = cert.error
     return [
         {
             "kind": "mechanic",
             "health": data,
             "thawed": thawed,
+            "certification_error": cert_error,
             "tools": world.tools.available_to("mechanic") if world.tools else [],
         }
     ]
@@ -61,18 +96,49 @@ def bookkeeper(world: World) -> list[dict[str, Any]]:
 def risk(world: World) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     world.broker.roll_windows(world.now)
-    if world.broker.maybe_unfreeze(world.config.risk, world.tick, cooldown=5):
-        out.append({"kind": "broker_thaw", "broker": world.broker.snapshot()})
-    halt = world.broker.maybe_halt(world.config.risk, tick=world.tick)
+    if world.config.mode == "live":
+        broker_thawed = world.broker.maybe_unfreeze(
+            world.config.risk,
+            world.tick,
+            cooldown=timedelta(hours=world.config.live_timing.broker_cooldown_hours),
+            now=world.now,
+        )
+    else:
+        broker_thawed = world.broker.maybe_unfreeze(world.config.risk, world.tick, cooldown=5)
+    if broker_thawed:
+        trader_thawed = "trader" not in world.frozen
+        freeze = world.freeze_info.get("trader") or {}
+        if not trader_thawed and freeze.get("kind") == "circuit_breaker":
+            trader_thawed = world.thaw("trader", "broker cooldown complete")
+        if trader_thawed:
+            out.append({"kind": "broker_thaw", "broker": world.broker.snapshot()})
+        else:
+            world.broker.frozen = True
+            world.broker.halted_at = world.now
+            world.broker.halt_reason = "trader_still_frozen"
+            out.append({"kind": "broker_thaw_blocked", "reason": freeze.get("kind")})
+    halt = world.broker.maybe_halt(
+        world.config.risk,
+        tick=world.tick,
+        now=world.now if world.config.mode == "live" else None,
+    )
     if halt:
-        world.freeze("trader", halt)
+        world.freeze("trader", halt, kind="circuit_breaker")
         out.append({"kind": "circuit_break", "reason": halt, "broker": world.broker.snapshot()})
     for agent, score in list(world.reputation.scores.items()):
         if score < 20 and agent not in world.frozen:
             fr = world.use_tool("risk", "governance.freeze", target=agent, reason=f"rep {score}")
-            if not fr.ok:
-                world.freeze(agent, f"rep {score}")
-            out.append({"kind": "rep_freeze", "agent": agent, "score": score})
+            if fr.ok:
+                out.append({"kind": "rep_freeze", "agent": agent, "score": score})
+            else:
+                out.append(
+                    {
+                        "kind": "rep_freeze_error",
+                        "agent": agent,
+                        "score": score,
+                        "error": fr.error,
+                    }
+                )
     if world.config.risk.operating_cash_is_tradable:
         world.config.risk.operating_cash_is_tradable = False
         out.append({"kind": "policy", "rule": "operating_cash_walled"})
@@ -86,8 +152,13 @@ def ethics(world: World) -> list[dict[str, Any]]:
         blob = json.dumps(ev).lower()
         if any(s in blob for s in ("mnemonic", "sol_secret", "eth_key", "smtp_pass")):
             world.reputation.slash("operator", 50, "secret leakage")
-            world.use_tool("ethics", "governance.freeze", target="operator", reason="secret leakage")
-            notes.append("secret_leak")
+            frozen = world.use_tool(
+                "ethics",
+                "governance.freeze",
+                target="operator",
+                reason="secret leakage",
+            )
+            notes.append("secret_leak" if frozen.ok else {"freeze_error": frozen.error})
     applies = len(world.store.jobs("applied"))
     accepts = len(world.store.jobs("accepted")) + len(world.store.jobs("paid")) + len(world.store.jobs("invoiced"))
     if applies >= 12 and accepts == 0:
@@ -108,14 +179,34 @@ def director(world: World) -> list[dict[str, Any]]:
     gap = max(0.0, goals.minimum_usd - snap["trailing_30d_usd"])
     roi = play_roi(world.store.outcomes(80))
     note = "hold labor-first mix" if gap > 0 else "shift toward retainers/products"
-    if world.tick % 20 == 0 and world.config.mode == "live":
-        world.router.complete(
-            f"Weekly council. Trailing={snap['trailing_30d_usd']} gap_to_min={gap}. {note}. roi={roi}",
+    model_error = None
+    if world.config.mode == "live" and world.scheduler.claim(
+        "director_model",
+        now=world.now,
+        tick=world.tick,
+        sim_every_ticks=20,
+        live_every=timedelta(hours=world.config.live_timing.director_cadence_hours),
+    ):
+        model = world.use_tool(
+            "director",
+            "brain.complete",
+            prompt=f"Weekly council. Trailing={snap['trailing_30d_usd']} gap_to_min={gap}. {note}. roi={roi}",
             tier="think",
             system=playbook(world, "director"),
         )
+        if not model.ok:
+            model_error = model.error
     world.store.set_kv("attention", attention_map(snap["trailing_30d_usd"], goals.minimum_usd, goals.recommended_usd, roi=roi))
-    return [{"kind": "direct", "missions_opened": len(created), "gap_to_min": gap, "note": note, "roi": roi}]
+    return [
+        {
+            "kind": "direct",
+            "missions_opened": len(created),
+            "gap_to_min": gap,
+            "note": note,
+            "roi": roi,
+            "model_error": model_error,
+        }
+    ]
 
 
 def hunter(world: World) -> list[dict[str, Any]]:
@@ -126,18 +217,27 @@ def hunter(world: World) -> list[dict[str, Any]]:
         found = world.board.search(tick=world.tick, live=live, include_sim=world.config.mode == "sim")
     taken = 0
     picked = []
+    errors = []
     existing = {j["id"] for j in world.store.jobs()}
     for job in found:
         if job["id"] in existing:
             continue
         if job.get("fit", 0) < 0.45:
             continue
-        job["status"] = "open"
+        if (
+            world.config.mode == "live"
+            and job.get("remote") is True
+            and job.get("contact_verified") is not True
+        ):
+            job["status"] = "needs_channel"
+        else:
+            job["status"] = "open"
         if not job.get("price_usd"):
             job["price_usd"] = quote_usd(job)
         up = world.use_tool("hunter", "jobs.upsert", job=job)
         if not up.ok:
-            world.store.upsert_job(job)
+            errors.append({"id": job["id"], "operation": "jobs.upsert", "error": up.error})
+            continue
         picked.append(job["title"])
         taken += 1
         if taken >= 4:
@@ -151,49 +251,70 @@ def hunter(world: World) -> list[dict[str, Any]]:
             fields=["note"],
             why="Extra channels. Not required to earn.",
         )
-    return [{"kind": "hunt", "new": taken, "titles": picked}]
+    return [{"kind": "hunt", "new": taken, "titles": picked, "errors": errors}]
+
+
+def _needs_verified_channel(world: World, job: dict[str, Any]) -> bool:
+    return (
+        world.config.mode == "live"
+        and job.get("remote") is True
+        and job.get("contact_verified") is not True
+    )
 
 
 def closer(world: World) -> list[dict[str, Any]]:
     for j in world.store.jobs("applied"):
-        age = world.tick - int(j.get("applied_tick") or 0)
-        if age >= 14:
+        if world.config.mode == "sim":
+            expired = world.tick - int(j.get("applied_tick") or 0) >= 14
+        else:
+            age = elapsed_days(world.now, j.get("applied_ts"))
+            expired = age is not None and age >= world.config.live_timing.proposal_expiry_days
+        if expired:
             j["status"] = "expired"
             world.store.upsert_job(j)
-    if world.config.mode == "live" and world.router.degraded:
-        return [{"kind": "close", "skipped": "budget_degraded", "queued": world.router.queued}]
-    open_jobs = [j for j in world.store.jobs("open")]
-    open_jobs.sort(key=lambda j: j.get("fit", 0), reverse=True)
+    candidates = world.store.jobs("open") + world.store.jobs("queued_budget")
     results = []
+    open_jobs = []
+    for job in candidates:
+        if _needs_verified_channel(world, job):
+            job["status"] = "needs_channel"
+            world.store.upsert_job(job)
+            results.append(
+                {
+                    "id": job["id"],
+                    "status": "needs_channel",
+                    "url": job.get("url"),
+                    "reason": "unverified_public_contact",
+                }
+            )
+        else:
+            open_jobs.append(job)
+    if world.config.mode == "live":
+        world.router.remaining_budget()
+        if world.router.degraded:
+            return [
+                {
+                    "kind": "close",
+                    "skipped": "budget_degraded",
+                    "queued": world.router.queued,
+                    "results": results,
+                }
+            ]
+    open_jobs.sort(key=lambda j: j.get("fit", 0), reverse=True)
     cap = world.config.apply_cap()
     day = world.now.date().isoformat()
     counts = dict(world.store.get_kv("apply_by_day") or {})
     already = int(counts.get(day, 0))
-    budget = min(3 if world.config.mode == "sim" else 2, max(0, cap - already))
+    send_limit = min(3 if world.config.mode == "sim" else 2, max(0, cap - already))
     rate = world.config.sim.close_rate if world.config.mode == "sim" else 1.0
     applied_today = already
-    for job in open_jobs[:budget]:
+    sent_count = 0
+    for job in open_jobs:
+        if sent_count >= send_limit:
+            break
         job["price_usd"] = quote_usd(job)
-        pb = playbook(world, "closer", job["id"])
-        blurb = world.use_tool(
-            "closer",
-            "brain.complete",
-            prompt=f"Write a short proposal for: {job.get('title')}\n{job.get('description','')}\nPlaybook:\n{pb}",
-            tier="work",
-            system=pb,
-        )
-        blurb_text = blurb.data if blurb.ok else str(blurb.error or "")
-        if world.config.mode == "live" and not blurb_text:
-            job["status"] = "queued_budget"
-            world.store.upsert_job(job)
-            results.append({"id": job["id"], "status": "queued_budget"})
-            continue
-        text = proposal_text(job, world.config.firm_name, blurb_text)
-        job["proposal"] = text
-        trial_p = world.config.paths().playbooks / "closer.trial.md"
-        job["ab_variant"] = "trial" if trial_p.exists() and pb == trial_p.read_text() else "control"
         to = job.get("contact") or job.get("email")
-        if not to:
+        if not to and not (world.config.mode == "live" and job.get("remote") is True):
             from sovereign.labor.boards import extract_email
 
             to = extract_email(str(job.get("description") or ""))
@@ -204,6 +325,34 @@ def closer(world: World) -> list[dict[str, Any]]:
                 results.append({"id": job["id"], "status": "needs_channel", "url": job.get("url")})
                 continue
             to = "client@unknown.local"
+        pb = playbook(world, "closer", job["id"])
+        blurb = world.use_tool(
+            "closer",
+            "brain.complete",
+            prompt=f"Write a short proposal for: {job.get('title')}\n{job.get('description','')}\nPlaybook:\n{pb}",
+            tier="work",
+            system=pb,
+        )
+        if not blurb.ok:
+            results.append(
+                {
+                    "id": job["id"],
+                    "status": "error",
+                    "operation": "brain.complete",
+                    "error": blurb.error,
+                }
+            )
+            continue
+        blurb_text = str(blurb.data or "")
+        if world.config.mode == "live" and not blurb_text:
+            job["status"] = "queued_budget"
+            world.store.upsert_job(job)
+            results.append({"id": job["id"], "status": "queued_budget"})
+            continue
+        text = proposal_text(job, world.config.firm_name, blurb_text)
+        job["proposal"] = text
+        trial_p = world.config.paths().playbooks / "closer.trial.md"
+        job["ab_variant"] = "trial" if trial_p.exists() and pb == trial_p.read_text() else "control"
         sent = world.use_tool(
             "closer",
             "mail.send",
@@ -214,26 +363,26 @@ def closer(world: World) -> list[dict[str, Any]]:
             kind="proposal",
         )
         if not sent.ok:
-            mailbox.send(
-                world,
-                to=to,
-                subject=f"Proposal: {job.get('title')} [{job['id']}]",
-                body=text,
-                job_id=job["id"],
-                kind="proposal",
+            results.append(
+                {
+                    "id": job["id"],
+                    "status": "error",
+                    "operation": "mail.send",
+                    "error": sent.error,
+                }
             )
+            continue
         job["applied_tick"] = world.tick
         job["applied_ts"] = world.stamp()
+        sent_count += 1
         applied_today += 1
         if world.config.auto_accept():
             if sim_client_accepts(job, text, close_rate=rate):
                 accept_job(world, job["id"], source="sim")
                 results.append({"id": job["id"], "status": "accepted", "price": job.get("price_usd")})
             else:
-                job["status"] = "rejected"
-                world.store.upsert_job(job)
-                world.store.outcome("proposal", 0, False, job["title"], "closer", "labor_studio")
-                results.append({"id": job["id"], "status": "rejected"})
+                rejected = reject_job(world, job["id"], source="sim")
+                results.append({"id": job["id"], "status": rejected["status"]})
         else:
             job["status"] = "applied"
             world.store.upsert_job(job)
@@ -243,18 +392,84 @@ def closer(world: World) -> list[dict[str, Any]]:
     return [{"kind": "close", "results": results}]
 
 
+def _queued_craft_ready(world: World) -> bool:
+    if world.config.mode != "live":
+        return True
+    remaining = world.router.remaining_budget()
+    if not world.router.degraded:
+        return True
+    reason = str(world.router.last_error or "").lower()
+    if "budget" in reason:
+        return False
+    if not world.scheduler.claim(
+        "craft_provider_retry",
+        now=world.now,
+        tick=world.tick,
+        sim_every_ticks=1,
+        live_every=timedelta(hours=world.config.live_timing.craft_retry_hours),
+    ):
+        return False
+    provider_ready = (
+        world.config.models.provider == "claude_code"
+        and world.router.claude.available()
+        and remaining > 0
+    )
+    if not provider_ready:
+        return False
+    world.router.degraded = False
+    world.router.last_error = None
+    return True
+
+
 def crafter(world: World) -> list[dict[str, Any]]:
-    queue = world.store.jobs("accepted") + world.store.jobs("in_progress")
+    queued = world.store.jobs("queued_craft")
+    if queued and not _queued_craft_ready(world):
+        job = queued[0]
+        return [
+            {
+                "kind": "craft",
+                "job": job["id"],
+                "status": "queued_craft",
+                "skipped": "router_degraded",
+                "reason": world.router.last_error,
+            }
+        ]
+    queue = queued + world.store.jobs("accepted") + world.store.jobs("in_progress")
     if not queue:
         return [{"kind": "craft", "did": 0}]
     job = queue[0]
-    job["status"] = "in_progress"
-    world.store.upsert_job(job)
     produced = world.use_tool("crafter", "craft.produce", job=job)
-    artifact = produced.data if produced.ok else produce(world, job)
+    if not produced.ok:
+        return [
+            {
+                "kind": "craft",
+                "job": job["id"],
+                "operation": "craft.produce",
+                "error": produced.error,
+            }
+        ]
+    artifact = produced.data
+    if isinstance(artifact, dict) and artifact.get("queued"):
+        if world.config.mode == "live":
+            world.scheduler.mark("craft_provider_retry", now=world.now)
+        job["status"] = "queued_craft"
+        job.setdefault("queued_craft_ts", world.stamp())
+        job["queued_craft_reason"] = world.router.last_error or "model unavailable"
+        world.store.upsert_job(job)
+        return [
+            {
+                "kind": "craft",
+                "job": job["id"],
+                "status": "queued_craft",
+                "queued": True,
+                "reason": job["queued_craft_reason"],
+            }
+        ]
     if not isinstance(artifact, dict) or not artifact.get("delivery"):
-        return [{"kind": "craft", "error": getattr(produced, "error", None) or "no artifact"}]
+        return [{"kind": "craft", "job": job["id"], "error": "no artifact"}]
     job["status"] = "delivered"
+    job.pop("queued_craft_ts", None)
+    job.pop("queued_craft_reason", None)
     job["delivery_path"] = artifact["delivery"]
     job["entry"] = artifact.get("entry")
     job["files"] = artifact.get("files")
@@ -265,33 +480,51 @@ def crafter(world: World) -> list[dict[str, Any]]:
 
     record(world, "crafter.deliver", True, float(job.get("price_usd") or 0))
     dest = job.get("contact") or job.get("email")
+    mail_error = None
     if dest or world.config.mode == "sim":
-        mailbox.send(
-            world,
+        sent = world.use_tool(
+            "crafter",
+            "mail.send",
             to=dest or "client@unknown.local",
             subject=f"Delivery: {job.get('title')} [{job['id']}]",
             body=f"Files are ready. Entry: {artifact.get('entry')}\nInvoice follows.",
             job_id=job["id"],
             kind="delivery",
         )
-    return [{"kind": "craft", "job": job["id"], "path": artifact["delivery"], "files": artifact.get("files")}]
+        if not sent.ok:
+            mail_error = sent.error
+    return [
+        {
+            "kind": "craft",
+            "job": job["id"],
+            "path": artifact["delivery"],
+            "files": artifact.get("files"),
+            "mail_error": mail_error,
+        }
+    ]
 
 
 def treasurer(world: World) -> list[dict[str, Any]]:
     issued = []
+    errors = []
     for job in world.store.jobs("delivered"):
         income = "income.products" if job.get("source") == "product" else "income.labor"
         if "retainer" in str(job.get("title", "")).lower():
             income = "income.retainers"
         inv_r = world.use_tool("treasurer", "invoice.issue", job=job, income_account=income)
-        inv = inv_r.data if inv_r.ok else invoices.issue(world, job, income_account=income)
+        if not inv_r.ok:
+            errors.append({"job": job["id"], "operation": "invoice.issue", "error": inv_r.error})
+            continue
+        inv = inv_r.data
         if not isinstance(inv, dict):
+            errors.append({"job": job["id"], "operation": "invoice.issue", "error": "invalid result"})
             continue
         issued.append(inv["id"])
         dest = job.get("contact") or job.get("email")
         if dest or world.config.mode == "sim":
-            mailbox.send(
-                world,
+            sent = world.use_tool(
+                "treasurer",
+                "mail.send",
                 to=dest or "client@unknown.local",
                 subject=f"Invoice {inv['id']} — ${inv['amount']:.0f} USDC [{job['id']}]",
                 body=(
@@ -301,6 +534,8 @@ def treasurer(world: World) -> list[dict[str, Any]]:
                 job_id=job["id"],
                 kind="invoice",
             )
+            if not sent.ok:
+                errors.append({"invoice": inv["id"], "operation": "mail.send", "error": sent.error})
 
     collected = []
     if world.config.autocollect():
@@ -309,13 +544,21 @@ def treasurer(world: World) -> list[dict[str, Any]]:
             issued_tick = int(inv.get("issued_tick") or 0)
             if world.tick - issued_tick >= delay:
                 got = world.use_tool("treasurer", "invoice.collect", ref=inv["id"], source="autocollect")
-                collected.append(got.data if got.ok else invoices.collect(world, inv["id"], source="autocollect"))
+                if got.ok and isinstance(got.data, dict):
+                    collected.append(got.data)
+                elif not got.ok:
+                    errors.append({"invoice": inv["id"], "operation": "invoice.collect", "error": got.error})
     else:
         collected.extend(watch_and_collect(world))
         from sovereign.capital.invoice import void
 
         for inv in world.store.invoices("open"):
-            if world.tick - int(inv.get("issued_tick") or 0) >= 90:
+            if world.config.mode == "sim":
+                aged = world.tick - int(inv.get("issued_tick") or 0) >= 90
+            else:
+                age = elapsed_days(world.now, inv.get("ts"))
+                aged = age is not None and age >= world.config.live_timing.invoice_void_days
+            if aged:
                 void(world, inv["id"], reason="aged")
 
     snap = world.ledger.snapshot(now=world.now)
@@ -337,9 +580,25 @@ def treasurer(world: World) -> list[dict[str, Any]]:
             "kind": "treasury",
             "issued": issued,
             "collected": [c.get("id") for c in collected],
+            "errors": errors,
             "policy": world.treasury.policy_status(),
         }
     ]
+
+
+def _oos_sharpe(report: dict[str, Any]) -> float:
+    try:
+        return float((report.get("oos") or {}).get("sharpe", float("-inf")))
+    except (TypeError, ValueError):
+        return float("-inf")
+
+
+def _strategy_warmup(strategy: Any) -> int:
+    values = [
+        getattr(strategy, name, 0)
+        for name in ("lookback", "vol_lookback", "fast", "slow")
+    ]
+    return max((int(v) for v in values if isinstance(v, (int, float))), default=0)
 
 
 def trader(world: World) -> list[dict[str, Any]]:
@@ -351,18 +610,39 @@ def trader(world: World) -> list[dict[str, Any]]:
     if world.treasury.trading_book() <= 0 and world.broker.cash <= 0:
         return [{"kind": "trade", "skipped": "no_book"}]
 
-    sid = certified[0]["strategy_id"]
-    strat = STRATEGIES[sid]
+    selected = max(certified, key=_oos_sharpe)
+    sid = str(selected.get("strategy_id") or "")
+    strat = STRATEGIES.get(sid)
+    if strat is None:
+        return [{"kind": "trade", "skipped": "unknown_strategy", "strategy": sid}]
     close = np.array(world.market_close, dtype=float)
-    idx = min(len(close) - 1, max(strat.__dict__.get("lookback", 50) + 5, 60 + world.tick))
+    warmup = _strategy_warmup(strat)
+    if len(close) <= warmup:
+        return [
+            {
+                "kind": "trade",
+                "skipped": "warmup",
+                "strategy": sid,
+                "required": warmup + 1,
+                "available": len(close),
+            }
+        ]
+    if world.config.mode == "live":
+        idx = len(close) - 1
+    else:
+        idx = min(len(close) - 1, max(warmup + 5, 60 + world.tick))
     price = float(close[idx])
     world.broker.mark(price)
     world.broker.roll_windows(world.now)
     pos = strat.positions(close[: idx + 1])
     desired_frac = float(pos[-2] if len(pos) > 1 else 0.0)
     book = max(world.broker.equity(), world.treasury.trading_book(), 1.0)
-    max_notional = book * world.config.risk.max_leverage
-    desired_notional = max(-max_notional, min(max_notional, desired_frac * book * 0.5))
+    leverage_cap = book * max(0.0, world.config.risk.max_leverage)
+    wallet_cap = max(0.0, world.config.risk.hot_wallet_cap_usd)
+    signal_cap = book * max(0.0, world.config.risk.trading_risk_per_signal)
+    max_notional = min(leverage_cap, wallet_cap, signal_cap)
+    signal_strength = max(-1.0, min(1.0, desired_frac))
+    desired_notional = signal_strength * max_notional
     fill = world.broker.target_position(desired_notional, price, world.config.risk.round_trip_cost)
     eq = world.broker.equity()
     prev = world.store.get_kv("trader_last_eq", eq)
@@ -373,21 +653,49 @@ def trader(world: World) -> list[dict[str, Any]]:
             world.ledger.post("assets.trading_book", "income.trading_paper", delta, "mtm gain", ts=world.stamp())
         else:
             world.ledger.post("income.trading_paper", "assets.trading_book", -delta, "mtm loss", ts=world.stamp())
-    return [{"kind": "trade", "strategy": sid, "price": price, "fill": fill, "equity": eq}]
+    return [
+        {
+            "kind": "trade",
+            "strategy": sid,
+            "price": price,
+            "fill": fill,
+            "equity": eq,
+            "position_cap_usd": max_notional,
+        }
+    ]
 
 
 def publisher(world: World) -> list[dict[str, Any]]:
-    if world.tick % 8 != 0:
+    if not world.scheduler.claim(
+        "publisher_model",
+        now=world.now,
+        tick=world.tick,
+        sim_every_ticks=8,
+        live_every=timedelta(hours=world.config.live_timing.publisher_cadence_hours),
+    ):
         return [{"kind": "publish", "skipped": True}]
     deliveries = [p for p in world.config.paths().deliveries.rglob("*") if p.is_file()]
     if not deliveries:
         return [{"kind": "publish", "skipped": "no_deliveries"}]
     latest = max(deliveries, key=lambda p: p.stat().st_mtime)
     listing = world.config.paths().artifacts / "product_listing.md"
-    copy = world.router.complete(
-        f"Write a 1-page product listing based on this delivery:\n{latest.read_text(errors='ignore')[:1500]}",
+    generated = world.use_tool(
+        "publisher",
+        "brain.complete",
+        prompt=f"Write a 1-page product listing based on this delivery:\n{latest.read_text(errors='ignore')[:1500]}",
         tier="work",
     )
+    if not generated.ok:
+        return [
+            {
+                "kind": "publish",
+                "operation": "brain.complete",
+                "error": generated.error,
+            }
+        ]
+    copy = str(generated.data or "")
+    if not copy:
+        return [{"kind": "publish", "skipped": "empty_model_result"}]
     listing.write_text(
         f"# Product listing — {world.config.firm_name}\n\n{copy}\n\nPay USDC to {world.identity.get('eth')}\n"
     )
@@ -458,13 +766,30 @@ def scout(world: World) -> list[dict[str, Any]]:
                     "contact": "retainer@sim.local",
                 }
             )
-    if world.tick % 10 != 0:
+    if not world.scheduler.claim(
+        "scout_model",
+        now=world.now,
+        tick=world.tick,
+        sim_every_ticks=10,
+        live_every=timedelta(hours=world.config.live_timing.scout_cadence_hours),
+    ):
         return [{"kind": "scout", "offers": len(catalog)}]
-    note = world.router.complete(
-        f"Pick the better next experiment given trailing={world.ledger.snapshot(now=world.now)['trailing_30d_usd']} offers={catalog}",
+    model = world.use_tool(
+        "scout",
+        "brain.complete",
+        prompt=f"Pick the better next experiment given trailing={world.ledger.snapshot(now=world.now)['trailing_30d_usd']} offers={catalog}",
         tier="fast",
     )
-    return [{"kind": "scout", "ideas": catalog, "note": note}]
+    if not model.ok:
+        return [
+            {
+                "kind": "scout",
+                "ideas": catalog,
+                "operation": "brain.complete",
+                "error": model.error,
+            }
+        ]
+    return [{"kind": "scout", "ideas": catalog, "note": str(model.data or "")}]
 
 
 def operator(world: World) -> list[dict[str, Any]]:
@@ -501,6 +826,14 @@ def operator(world: World) -> list[dict[str, Any]]:
 
 
 def auditor(world: World) -> list[dict[str, Any]]:
+    if not world.scheduler.claim(
+        "auditor_model",
+        now=world.now,
+        tick=world.tick,
+        sim_every_ticks=1,
+        live_every=timedelta(hours=world.config.live_timing.auditor_cadence_hours),
+    ):
+        return [{"kind": "audit", "skipped": True}]
     notes = []
     delivered = [
         j
@@ -530,16 +863,33 @@ def auditor(world: World) -> list[dict[str, Any]]:
         for e in world.store.events(5)
     )
     _ = live_uncert
-    verdict = world.router.complete(
-        f"Audit notes: {notes}. Slash spray or uncertified live trades.",
+    model = world.use_tool(
+        "auditor",
+        "brain.complete",
+        prompt=f"Audit notes: {notes}. Slash spray or uncertified live trades.",
         tier="fast",
         system="Return a one-line verdict.",
     )
-    return [{"kind": "audit", "notes": notes, "verdict": verdict}]
+    if not model.ok:
+        return [
+            {
+                "kind": "audit",
+                "notes": notes,
+                "operation": "brain.complete",
+                "error": model.error,
+            }
+        ]
+    return [{"kind": "audit", "notes": notes, "verdict": str(model.data or "")}]
 
 
 def improver(world: World) -> list[dict[str, Any]]:
-    if world.tick % 7 != 0:
+    if not world.scheduler.claim(
+        "improver_model",
+        now=world.now,
+        tick=world.tick,
+        sim_every_ticks=7,
+        live_every=timedelta(hours=world.config.live_timing.improver_cadence_hours),
+    ):
         return []
     from sovereign.memory.playbooks import promote_trial, revert_trial
     from sovereign.memory.skills import record
@@ -553,6 +903,7 @@ def improver(world: World) -> list[dict[str, Any]]:
     trial_p = world.config.paths().playbooks / "closer.trial.md"
     promoted = False
     reverted = False
+    model_error = None
     tn, cn = int(ab.get("trial_n", 0)), int(ab.get("control_n", 0))
     tw, cw = float(ab.get("trial_usd", 0)), float(ab.get("control_usd", 0))
     if trial_p.exists() and tn >= 6 and cn >= 6:
@@ -573,21 +924,41 @@ def improver(world: World) -> list[dict[str, Any]]:
             tier="work",
             system=playbook(world, "improver"),
         )
-        body = patch.data if patch.ok else (
-            "# Closer trial\n- Name their stack in line 1.\n- Fixed price + USDC + 48h + kill-scope.\n"
-        )
-        world.use_tool("improver", "playbook.write_trial", agent="closer", body=str(body))
+        if patch.ok and patch.data:
+            wrote = world.use_tool(
+                "improver",
+                "playbook.write_trial",
+                agent="closer",
+                body=str(patch.data),
+            )
+            if not wrote.ok:
+                model_error = wrote.error
+        else:
+            model_error = patch.error or "empty model result"
     override = world.store.get_kv("attention_override") or {}
-    age_days = world.tick * (world.config.tick_hours / 24.0)
+    if world.config.mode == "sim":
+        age_days = world.tick * (world.config.tick_hours / 24.0)
+    else:
+        age_days = elapsed_days(world.now, world.identity.get("born")) or 0.0
     for p in PLAYS:
         play_usd = sum(float(o.get("usd") or 0) for o in outcomes if o.get("play_id") == p.id and o.get("success"))
         if age_days >= p.kill_after_days_if_zero and play_usd <= 0:
             override[p.id] = 0.0
-        elif roi.get(p.id, 0) <= 0 and world.tick > 14:
+        elif roi.get(p.id, 0) <= 0 and age_days > 14:
             override[p.id] = max(0.01, attention_map(0, 2000, 5000).get(p.id, 0.05) * 0.5)
     if override:
         world.store.set_kv("attention_override", override)
-    return [{"kind": "improve", "winrate": round(wins / n, 3), "promoted": promoted, "reverted": reverted, "roi": roi, "ab": ab}]
+    return [
+        {
+            "kind": "improve",
+            "winrate": round(wins / n, 3),
+            "promoted": promoted,
+            "reverted": reverted,
+            "roi": roi,
+            "ab": ab,
+            "model_error": model_error,
+        }
+    ]
 
 
 def courier(world: World) -> list[dict[str, Any]]:
