@@ -7,7 +7,9 @@ There is no approval queue for ordinary work.
 
 Cognition uses a **Claude Pro/Max subscription** via Claude Code
 (`claude -p`), not the Anthropic API. Most ticks use no model at all:
-bookkeeping, scraping, risk, and trade signals are code.
+bookkeeping, scraping, risk, and trade signals are code. No Anthropic HTTP
+fallback is currently implemented; live fallback and token-accounting details
+are documented in [`docs/MODELS.md`](docs/MODELS.md).
 
 ## Targets
 
@@ -34,6 +36,40 @@ sovereign backtest --live-data           # certify strategies on public BTC
 sovereign dashboard                      # observer: pipeline, invoices, wallets, health
 ```
 
+The dashboard is unauthenticated only on its default loopback bind. Every
+`/api/*` route requires `Authorization: Bearer …` when
+`SOVEREIGN_DASHBOARD_TOKEN` is set, and a non-loopback bind is refused without
+that variable:
+
+```bash
+export SOVEREIGN_DASHBOARD_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+sovereign dashboard --host 0.0.0.0
+curl -H "Authorization: Bearer $SOVEREIGN_DASHBOARD_TOKEN" http://127.0.0.1:7474/api/status
+```
+
+After the first unauthorized API response, the browser UI shows a password
+input, keeps the token in session storage, and sends it only in the
+`Authorization` header—not in the URL. Put TLS in front of any non-loopback
+deployment; bearer tokens are not transport encryption.
+
+Strategy certification requires at least 480 finite, positive, chronological
+daily bars: 400 train bars plus 80 out-of-sample bars. Short histories fail
+closed and never use a half-split substitute. `n_trades` counts economic
+entries, exits, and direction changes, not volatility-target size adjustments.
+`positive_bar_rate` is the share of net-return bars above zero, not a trade win
+rate. `round_trip_cost` is the total entry-plus-exit cost, charged one half on
+each one-way unit of turnover.
+
+Live market scheduling uses wall-clock time rather than daemon tick counts.
+Prices refresh hourly by default. Certification retries hourly only while no
+certification report list exists (for example, while live prices are
+unavailable); after any report list is stored, normal recertification runs
+weekly. That switch is based on report existence, not on a strategy passing:
+an all-rejected or insufficient-data report still moves to the weekly cadence.
+These defaults are configurable through `live_timing.price_refresh_hours`,
+`live_timing.certification_retry_hours`, and
+`live_timing.recertify_hours`.
+
 Live labor loop (no auto-pay):
 
 ```bash
@@ -43,7 +79,7 @@ sovereign run --mode live --ticks 1000000
 sovereign accept job_...
 # or drop data/mail/inbox/lead.json with subject "job_... ACCEPTED"
 # after delivery the engine invoices USDC to the firm wallet
-sovereign paid inv_...                   # or it marks paid when USDC arrives
+sovereign paid inv_... --confirm         # manual live override after independent verification
 ```
 
 ## What is running
@@ -69,7 +105,11 @@ the same on demand. The daemon heals and continues after a crashed tick.
 Frozen agents thaw after a cooldown if reputation recovers. Improver A/B
 tests closer playbooks and promotes or reverts from measured USD.
 
-Wallets (ETH + SOL) are generated at init and encrypted at rest. Credentials
+New ETH and Solana accounts are derived from the init mnemonic and encrypted
+at rest. Existing encrypted wallet bundles are loaded unchanged. Legacy
+random Solana wallets are not derivable from that mnemonic and remain
+recoverable only from their `sol_secret` in `data/secrets.enc` (using
+`data/master.key`) until explicitly migrated; preserve both files. Credentials
 injected via `sovereign reply` land in the same vault; after consume they are
 scrubbed from `human_inbox.json` and never written to the event log or
 `human_replies.json`. Use `KEY=-` to read a secret from stdin (not argv).
@@ -88,4 +128,9 @@ exist; they autocollect). Live revenue requires real clients: proposals go
 to `data/mail/`, jobs stay `applied` until mail/`sovereign accept`, invoices
 stay open until chain watch or `sovereign paid`. Other plays keep running
 while a login sits in the inbox.
+
+Optional validated overrides can be placed in `data/config.yaml`; explicit
+`--mode` and `--data-dir` CLI arguments take precedence. A human or email
+claim that an invoice is paid never settles it—live manual settlement requires
+`sovereign paid ... --confirm`.
 """

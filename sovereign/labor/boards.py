@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 import time
-from typing import Any
+from typing import Any, Self
 
 import httpx
-
 
 SKILLS = (
     "python",
@@ -26,6 +24,10 @@ SKILLS = (
     "excel",
     "csv",
 )
+
+MAX_SOURCE_ITEMS = 40
+MAX_LIVE_JOBS = 60
+LIVE_CACHE_SECONDS = 300
 
 
 def _id(source: str, title: str, extra: str = "") -> str:
@@ -54,11 +56,34 @@ def score_job(title: str, description: str = "") -> float:
 class JobBoard:
     """Public boards + simulated marketplace. Live fetch is best-effort."""
 
-    def __init__(self, sim: bool = True) -> None:
+    def __init__(self, sim: bool = True, client: httpx.Client | None = None) -> None:
         self.sim = sim
         self._sim_catalog = _sim_jobs()
         self._live_cache: list[dict[str, Any]] = []
         self._live_at: float = 0.0
+        self._client = client
+        self._owns_client = client is None
+        self._fetch_errors: list[dict[str, Any]] = []
+        self._source_counts: dict[str, int] = {}
+
+    @property
+    def fetch_errors(self) -> list[dict[str, Any]]:
+        return [dict(error) for error in self._fetch_errors]
+
+    @property
+    def source_counts(self) -> dict[str, int]:
+        return dict(self._source_counts)
+
+    def close(self) -> None:
+        if self._owns_client and self._client is not None:
+            self._client.close()
+            self._client = None
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
 
     def search(self, tick: int = 0, live: bool = False, include_sim: bool = True) -> list[dict[str, Any]]:
         jobs: list[dict[str, Any]] = []
@@ -80,64 +105,127 @@ class JobBoard:
         out.sort(key=lambda x: x["fit"], reverse=True)
         return out
 
+    def search_with_metadata(
+        self,
+        tick: int = 0,
+        live: bool = False,
+        include_sim: bool = True,
+    ) -> dict[str, Any]:
+        """Search without changing role-facing results, while exposing fetch health."""
+        jobs = self.search(tick=tick, live=live, include_sim=include_sim)
+        return {
+            "jobs": jobs,
+            "fetch": {
+                "errors": self.fetch_errors,
+                "source_counts": self.source_counts,
+                "fetched_at": self._live_at or None,
+            },
+        }
+
+    def _http_client(self) -> httpx.Client:
+        if self._client is None:
+            self._client = httpx.Client(
+                timeout=httpx.Timeout(15.0, connect=5.0),
+                follow_redirects=True,
+                limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
+            )
+        return self._client
+
+    def _record_fetch_error(self, source: str, exc: Exception) -> None:
+        error: dict[str, Any] = {
+            "source": source,
+            "error_type": type(exc).__name__,
+            "message": str(exc)[:300] or type(exc).__name__,
+        }
+        if isinstance(exc, httpx.HTTPStatusError):
+            error["status_code"] = exc.response.status_code
+        self._fetch_errors.append(error)
+
     def _live(self) -> list[dict[str, Any]]:
         now = time.time()
-        if self._live_cache and now - self._live_at < 300:
+        if self._live_at > 0 and now - self._live_at < LIVE_CACHE_SECONDS:
             return list(self._live_cache)
+        self._fetch_errors = []
+        self._source_counts = {}
         found: list[dict[str, Any]] = []
-        try:
-            with httpx.Client(timeout=15.0, follow_redirects=True) as client:
-                r = client.get("https://www.arbeitnow.com/api/job-board-api")
-                if r.status_code == 200:
-                    data = r.json()
-                    for item in data.get("data", [])[:40]:
-                        title = item.get("title") or ""
-                        desc = (item.get("description") or "")[:1500]
-                        url = item.get("url") or ""
-                        found.append(
-                            {
-                                "id": _id("arbeitnow", title, url),
-                                "source": "arbeitnow",
-                                "title": title,
-                                "url": url,
-                                "description": desc,
-                                "contact": extract_email(desc),
-                                "price_usd": 0.0,
-                                "status": "open",
-                                "remote": True,
-                            }
-                        )
-        except Exception:
-            pass
-        try:
-            with httpx.Client(timeout=15.0, follow_redirects=True) as client:
-                r = client.get("https://remoteok.com/api", headers={"User-Agent": "SovereignEngine/0.1"})
-                if r.status_code == 200:
-                    data = r.json()
-                    for item in data:
-                        if not isinstance(item, dict) or "position" not in item and "title" not in item:
-                            continue
-                        title = item.get("position") or item.get("title") or ""
-                        if not title:
-                            continue
-                        found.append(
-                            {
-                                "id": _id("remoteok", title, item.get("url") or item.get("apply_url") or ""),
-                                "source": "remoteok",
-                                "title": title,
-                                "url": item.get("url") or item.get("apply_url") or "",
-                                "description": (item.get("description") or "")[:1500],
-                                "contact": extract_email(item.get("description") or "") or item.get("email"),
-                                "price_usd": 0.0,
-                                "status": "open",
-                                "remote": True,
-                            }
-                        )
-        except Exception:
-            pass
-        self._live_cache = found[:60]
+        client = self._http_client()
+        for source, fetcher in (
+            ("arbeitnow", self._fetch_arbeitnow),
+            ("remoteok", self._fetch_remoteok),
+        ):
+            try:
+                source_jobs = fetcher(client)
+            except Exception as exc:  # noqa: BLE001 - isolate independent external sources
+                self._record_fetch_error(source, exc)
+                source_jobs = []
+            self._source_counts[source] = len(source_jobs)
+            found.extend(source_jobs)
+        self._live_cache = found[:MAX_LIVE_JOBS]
         self._live_at = now
         return list(self._live_cache)
+
+    def _fetch_arbeitnow(self, client: httpx.Client) -> list[dict[str, Any]]:
+        response = client.get("https://www.arbeitnow.com/api/job-board-api")
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+            raise TypeError("expected an object with a data list")
+        found = []
+        for item in data["data"][:MAX_SOURCE_ITEMS]:
+            if not isinstance(item, dict):
+                continue
+            title = item.get("title") or ""
+            if not title:
+                continue
+            desc = (item.get("description") or "")[:1500]
+            url = item.get("url") or ""
+            found.append(
+                {
+                    "id": _id("arbeitnow", title, url),
+                    "source": "arbeitnow",
+                    "title": title,
+                    "url": url,
+                    "description": desc,
+                    "contact": extract_email(desc),
+                    "price_usd": 0.0,
+                    "status": "open",
+                    "remote": True,
+                }
+            )
+        return found
+
+    def _fetch_remoteok(self, client: httpx.Client) -> list[dict[str, Any]]:
+        response = client.get(
+            "https://remoteok.com/api",
+            headers={"User-Agent": "SovereignEngine/0.1"},
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, list):
+            raise TypeError("expected a list response")
+        found = []
+        for item in data[:MAX_SOURCE_ITEMS]:
+            if not isinstance(item, dict) or ("position" not in item and "title" not in item):
+                continue
+            title = item.get("position") or item.get("title") or ""
+            if not title:
+                continue
+            url = item.get("url") or item.get("apply_url") or ""
+            description = (item.get("description") or "")[:1500]
+            found.append(
+                {
+                    "id": _id("remoteok", title, url),
+                    "source": "remoteok",
+                    "title": title,
+                    "url": url,
+                    "description": description,
+                    "contact": extract_email(description) or item.get("email"),
+                    "price_usd": 0.0,
+                    "status": "open",
+                    "remote": True,
+                }
+            )
+        return found
 
 
 def _sim_jobs() -> list[dict[str, Any]]:
