@@ -83,6 +83,7 @@ class World:
         )
 
     def load_kv(self) -> None:
+        self.ledger._bal_cache = None
         meta = self.store.get_kv("meta") or {}
         self.tick = int(meta.get("tick", 0))
         if meta.get("now"):

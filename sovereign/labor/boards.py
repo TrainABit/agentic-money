@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import time
 from typing import Any
 
 import httpx
@@ -26,9 +28,21 @@ SKILLS = (
 )
 
 
-def _id(source: str, title: str) -> str:
-    h = hashlib.sha1(f"{source}:{title}".encode()).hexdigest()[:12]
+def _id(source: str, title: str, extra: str = "") -> str:
+    h = hashlib.sha1(f"{source}:{title}:{extra}".encode()).hexdigest()[:12]
     return f"job_{h}"
+
+
+_EMAIL_RE = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9.-]+")
+
+
+def extract_email(text: str) -> str | None:
+    for m in _EMAIL_RE.finditer(text or ""):
+        addr = m.group().rstrip(".,;:")
+        if addr.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+            continue
+        return addr
+    return None
 
 
 def score_job(title: str, description: str = "") -> float:
@@ -43,6 +57,8 @@ class JobBoard:
     def __init__(self, sim: bool = True) -> None:
         self.sim = sim
         self._sim_catalog = _sim_jobs()
+        self._live_cache: list[dict[str, Any]] = []
+        self._live_at: float = 0.0
 
     def search(self, tick: int = 0, live: bool = False, include_sim: bool = True) -> list[dict[str, Any]]:
         jobs: list[dict[str, Any]] = []
@@ -65,6 +81,9 @@ class JobBoard:
         return out
 
     def _live(self) -> list[dict[str, Any]]:
+        now = time.time()
+        if self._live_cache and now - self._live_at < 300:
+            return list(self._live_cache)
         found: list[dict[str, Any]] = []
         try:
             with httpx.Client(timeout=15.0, follow_redirects=True) as client:
@@ -73,13 +92,16 @@ class JobBoard:
                     data = r.json()
                     for item in data.get("data", [])[:40]:
                         title = item.get("title") or ""
+                        desc = (item.get("description") or "")[:1500]
+                        url = item.get("url") or ""
                         found.append(
                             {
-                                "id": _id("arbeitnow", title),
+                                "id": _id("arbeitnow", title, url),
                                 "source": "arbeitnow",
                                 "title": title,
-                                "url": item.get("url") or "",
-                                "description": (item.get("description") or "")[:1500],
+                                "url": url,
+                                "description": desc,
+                                "contact": extract_email(desc),
                                 "price_usd": 0.0,
                                 "status": "open",
                                 "remote": True,
@@ -100,11 +122,12 @@ class JobBoard:
                             continue
                         found.append(
                             {
-                                "id": _id("remoteok", title),
+                                "id": _id("remoteok", title, item.get("url") or item.get("apply_url") or ""),
                                 "source": "remoteok",
                                 "title": title,
                                 "url": item.get("url") or item.get("apply_url") or "",
                                 "description": (item.get("description") or "")[:1500],
+                                "contact": extract_email(item.get("description") or "") or item.get("email"),
                                 "price_usd": 0.0,
                                 "status": "open",
                                 "remote": True,
@@ -112,7 +135,9 @@ class JobBoard:
                         )
         except Exception:
             pass
-        return found[:60]
+        self._live_cache = found[:60]
+        self._live_at = now
+        return list(self._live_cache)
 
 
 def _sim_jobs() -> list[dict[str, Any]]:
@@ -170,6 +195,7 @@ def proposal_text(job: dict[str, Any], firm: str, brain_blurb: str) -> str:
         f"Price: ${job.get('price_usd', 0):.0f} fixed. "
         f"Turnaround: 48h. Payment: USDC on Ethereum/Solana or card. "
         f"Scope is the written brief; extras are a new quote.\n"
+        + (f"Apply URL: {job.get('url')}\n" if job.get("url") else "")
     )
 
 

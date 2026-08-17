@@ -19,7 +19,7 @@ class Store:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.db_path)
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30.0)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self._migrate()
@@ -110,6 +110,10 @@ class Store:
               status TEXT NOT NULL,
               payload TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+            CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status);
+            CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);
+            CREATE INDEX IF NOT EXISTS idx_ledger_ts ON ledger(ts);
             """
         )
         self.conn.commit()
@@ -150,7 +154,9 @@ class Store:
         )
         self.conn.commit()
 
-    def ledger_rows(self) -> list[sqlite3.Row]:
+    def ledger_rows(self, since: str | None = None) -> list[sqlite3.Row]:
+        if since:
+            return list(self.conn.execute("SELECT * FROM ledger WHERE ts >= ? ORDER BY id ASC", (since,)))
         return list(self.conn.execute("SELECT * FROM ledger ORDER BY id ASC"))
 
     def set_kv(self, k: str, v: Any) -> None:

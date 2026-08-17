@@ -60,7 +60,10 @@ def bookkeeper(world: World) -> list[dict[str, Any]]:
 
 def risk(world: World) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    halt = world.broker.maybe_halt(world.config.risk)
+    world.broker.roll_windows(world.now)
+    if world.broker.maybe_unfreeze(world.config.risk, world.tick, cooldown=5):
+        out.append({"kind": "broker_thaw", "broker": world.broker.snapshot()})
+    halt = world.broker.maybe_halt(world.config.risk, tick=world.tick)
     if halt:
         world.freeze("trader", halt)
         out.append({"kind": "circuit_break", "reason": halt, "broker": world.broker.snapshot()})
@@ -152,13 +155,23 @@ def hunter(world: World) -> list[dict[str, Any]]:
 
 
 def closer(world: World) -> list[dict[str, Any]]:
+    for j in world.store.jobs("applied"):
+        age = world.tick - int(j.get("applied_tick") or 0)
+        if age >= 14:
+            j["status"] = "expired"
+            world.store.upsert_job(j)
+    if world.config.mode == "live" and world.router.degraded:
+        return [{"kind": "close", "skipped": "budget_degraded", "queued": world.router.queued}]
     open_jobs = [j for j in world.store.jobs("open")]
     open_jobs.sort(key=lambda j: j.get("fit", 0), reverse=True)
     results = []
-    cap = world.config.daily_apply_cap
-    already = len(world.store.jobs("applied"))
+    cap = world.config.apply_cap()
+    day = world.now.date().isoformat()
+    counts = dict(world.store.get_kv("apply_by_day") or {})
+    already = int(counts.get(day, 0))
     budget = min(3 if world.config.mode == "sim" else 2, max(0, cap - already))
     rate = world.config.sim.close_rate if world.config.mode == "sim" else 1.0
+    applied_today = already
     for job in open_jobs[:budget]:
         job["price_usd"] = quote_usd(job)
         pb = playbook(world, "closer", job["id"])
@@ -170,11 +183,27 @@ def closer(world: World) -> list[dict[str, Any]]:
             system=pb,
         )
         blurb_text = blurb.data if blurb.ok else str(blurb.error or "")
+        if world.config.mode == "live" and not blurb_text:
+            job["status"] = "queued_budget"
+            world.store.upsert_job(job)
+            results.append({"id": job["id"], "status": "queued_budget"})
+            continue
         text = proposal_text(job, world.config.firm_name, blurb_text)
         job["proposal"] = text
         trial_p = world.config.paths().playbooks / "closer.trial.md"
         job["ab_variant"] = "trial" if trial_p.exists() and pb == trial_p.read_text() else "control"
-        to = job.get("contact") or job.get("email") or "client@unknown.local"
+        to = job.get("contact") or job.get("email")
+        if not to:
+            from sovereign.labor.boards import extract_email
+
+            to = extract_email(str(job.get("description") or ""))
+        if not to:
+            if world.config.mode == "live":
+                job["status"] = "needs_channel"
+                world.store.upsert_job(job)
+                results.append({"id": job["id"], "status": "needs_channel", "url": job.get("url")})
+                continue
+            to = "client@unknown.local"
         sent = world.use_tool(
             "closer",
             "mail.send",
@@ -193,6 +222,9 @@ def closer(world: World) -> list[dict[str, Any]]:
                 job_id=job["id"],
                 kind="proposal",
             )
+        job["applied_tick"] = world.tick
+        job["applied_ts"] = world.stamp()
+        applied_today += 1
         if world.config.auto_accept():
             if sim_client_accepts(job, text, close_rate=rate):
                 accept_job(world, job["id"], source="sim")
@@ -206,6 +238,8 @@ def closer(world: World) -> list[dict[str, Any]]:
             job["status"] = "applied"
             world.store.upsert_job(job)
             results.append({"id": job["id"], "status": "applied", "price": job.get("price_usd")})
+    counts[day] = applied_today
+    world.store.set_kv("apply_by_day", counts)
     return [{"kind": "close", "results": results}]
 
 
@@ -230,14 +264,16 @@ def crafter(world: World) -> list[dict[str, Any]]:
     from sovereign.memory.skills import record
 
     record(world, "crafter.deliver", True, float(job.get("price_usd") or 0))
-    mailbox.send(
-        world,
-        to=job.get("contact") or "client@unknown.local",
-        subject=f"Delivery: {job.get('title')} [{job['id']}]",
-        body=f"Files are ready. Entry: {artifact.get('entry')}\nInvoice follows.",
-        job_id=job["id"],
-        kind="delivery",
-    )
+    dest = job.get("contact") or job.get("email")
+    if dest or world.config.mode == "sim":
+        mailbox.send(
+            world,
+            to=dest or "client@unknown.local",
+            subject=f"Delivery: {job.get('title')} [{job['id']}]",
+            body=f"Files are ready. Entry: {artifact.get('entry')}\nInvoice follows.",
+            job_id=job["id"],
+            kind="delivery",
+        )
     return [{"kind": "craft", "job": job["id"], "path": artifact["delivery"], "files": artifact.get("files")}]
 
 
@@ -252,14 +288,19 @@ def treasurer(world: World) -> list[dict[str, Any]]:
         if not isinstance(inv, dict):
             continue
         issued.append(inv["id"])
-        mailbox.send(
-            world,
-            to=job.get("contact") or "client@unknown.local",
-            subject=f"Invoice {inv['id']} — ${inv['amount']:.0f} USDC [{job['id']}]",
-            body=f"Pay ${inv['amount']:.2f} USDC to {inv['eth_address']} memo {inv['memo']}",
-            job_id=job["id"],
-            kind="invoice",
-        )
+        dest = job.get("contact") or job.get("email")
+        if dest or world.config.mode == "sim":
+            mailbox.send(
+                world,
+                to=dest or "client@unknown.local",
+                subject=f"Invoice {inv['id']} — ${inv['amount']:.0f} USDC [{job['id']}]",
+                body=(
+                    f"Pay ${inv['amount']:.2f} USDC to ETH `{inv['eth_address']}` "
+                    f"or SOL `{inv.get('sol_address')}` memo {inv['memo']}"
+                ),
+                job_id=job["id"],
+                kind="invoice",
+            )
 
     collected = []
     if world.config.autocollect():
@@ -271,6 +312,11 @@ def treasurer(world: World) -> list[dict[str, Any]]:
                 collected.append(got.data if got.ok else invoices.collect(world, inv["id"], source="autocollect"))
     else:
         collected.extend(watch_and_collect(world))
+        from sovereign.capital.invoice import void
+
+        for inv in world.store.invoices("open"):
+            if world.tick - int(inv.get("issued_tick") or 0) >= 90:
+                void(world, inv["id"], reason="aged")
 
     snap = world.ledger.snapshot(now=world.now)
     if (
@@ -311,10 +357,12 @@ def trader(world: World) -> list[dict[str, Any]]:
     idx = min(len(close) - 1, max(strat.__dict__.get("lookback", 50) + 5, 60 + world.tick))
     price = float(close[idx])
     world.broker.mark(price)
+    world.broker.roll_windows(world.now)
     pos = strat.positions(close[: idx + 1])
-    desired_frac = float(pos[-1])
+    desired_frac = float(pos[-2] if len(pos) > 1 else 0.0)
     book = max(world.broker.equity(), world.treasury.trading_book(), 1.0)
-    desired_notional = desired_frac * book * 0.5
+    max_notional = book * world.config.risk.max_leverage
+    desired_notional = max(-max_notional, min(max_notional, desired_frac * book * 0.5))
     fill = world.broker.target_position(desired_notional, price, world.config.risk.round_trip_cost)
     eq = world.broker.equity()
     prev = world.store.get_kv("trader_last_eq", eq)
@@ -322,9 +370,9 @@ def trader(world: World) -> list[dict[str, Any]]:
     world.store.set_kv("trader_last_eq", eq)
     if abs(delta) >= 0.01:
         if delta > 0:
-            world.ledger.post("assets.trading_book", "income.trading", delta, "mtm gain", ts=world.stamp())
+            world.ledger.post("assets.trading_book", "income.trading_paper", delta, "mtm gain", ts=world.stamp())
         else:
-            world.ledger.post("income.trading", "assets.trading_book", -delta, "mtm loss", ts=world.stamp())
+            world.ledger.post("income.trading_paper", "assets.trading_book", -delta, "mtm loss", ts=world.stamp())
     return [{"kind": "trade", "strategy": sid, "price": price, "fill": fill, "equity": eq}]
 
 
@@ -530,8 +578,12 @@ def improver(world: World) -> list[dict[str, Any]]:
         )
         world.use_tool("improver", "playbook.write_trial", agent="closer", body=str(body))
     override = world.store.get_kv("attention_override") or {}
+    age_days = world.tick * (world.config.tick_hours / 24.0)
     for p in PLAYS:
-        if roi.get(p.id, 0) <= 0 and world.tick > 14:
+        play_usd = sum(float(o.get("usd") or 0) for o in outcomes if o.get("play_id") == p.id and o.get("success"))
+        if age_days >= p.kill_after_days_if_zero and play_usd <= 0:
+            override[p.id] = 0.0
+        elif roi.get(p.id, 0) <= 0 and world.tick > 14:
             override[p.id] = max(0.01, attention_map(0, 2000, 5000).get(p.id, 0.05) * 0.5)
     if override:
         world.store.set_kv("attention_override", override)

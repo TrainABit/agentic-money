@@ -8,14 +8,16 @@ The engine does not wait for a bank.
 4. `sovereign setup` then `sovereign doctor --fix` — repair engine files, then check Claude
 5. `sovereign run --mode sim --ticks 30` — prove the loop
 6. `sovereign dashboard` — observe only (health + tools included)
-7. Fill `sovereign inbox` items when you can (`sovereign reply hr_0001 ok=1`). Replies go into the encrypted vault and unblock that play.
+7. Fill `sovereign inbox` items when you can (`sovereign reply hr_0001 ok=1`, or `SMTP_PASS=-` and type the secret on stdin). Replies go into the encrypted vault; values are not kept in the inbox JSON.
 8. `sovereign serve --mode live` once Claude is logged in.
 
 If something is broken (corrupt `human_inbox.json`, missing playbook, stale
 `engine.lock`, unbound tools), do not start from scratch: `sovereign setup`
 is idempotent and the Mechanic agent runs the same repairs every tick.
 
-Live jobs stay `applied` until `sovereign accept JOB_ID` or a JSON drop in `data/mail/inbox/` whose subject contains the job id and `ACCEPTED`. Invoices stay open until USDC hits the ETH address or `sovereign paid INV_OR_JOB`.
+Live jobs stay `applied` until `sovereign accept JOB_ID` or a JSON drop in `data/mail/inbox/` whose subject contains the job id and `ACCEPTED`. Listings with no contact email are marked `needs_channel` (drop a lead JSON or apply at the URL). Invoices stay open until USDC hits the ETH or Solana address or `sovereign paid INV_OR_JOB`. Email text never marks an invoice paid.
+
+`data/master.key` decrypts `data/secrets.enc`. Keep the key off backups of the ciphertext if you can; mode `600` is the local floor, not a vault.
 
 Optional later (Courier will ask; other plays keep running):
 

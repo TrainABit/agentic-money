@@ -99,9 +99,19 @@ tick(); setInterval(tick, 3000);
 
 def create_app(data_dir: str, mode: str) -> FastAPI:
     app = FastAPI(title="Sovereign", docs_url=None, redoc_url=None)
+    cached: dict[str, object] = {"w": None}
 
     def world():
-        return bootstrap(EngineConfig(mode=mode, data_dir=Path(data_dir)))  # type: ignore[arg-type]
+        from sovereign.engine.world import World
+
+        w = cached["w"]
+        if w is None:
+            w = bootstrap(EngineConfig(mode=mode, data_dir=Path(data_dir)), heal=False)  # type: ignore[arg-type]
+            cached["w"] = w
+        else:
+            assert isinstance(w, World)
+            w.load_kv()
+        return w
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:

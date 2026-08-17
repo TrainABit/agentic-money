@@ -70,8 +70,18 @@ Frozen agents thaw after a cooldown if reputation recovers. Improver A/B
 tests closer playbooks and promotes or reverts from measured USD.
 
 Wallets (ETH + SOL) are generated at init and encrypted at rest. Credentials
-injected via `sovereign reply` land in the same vault and are never written
-to the event log. Mnemonic reveal requires `SOVEREIGN_CONFIRM_REVEAL=1`.
+injected via `sovereign reply` land in the same vault; after consume they are
+scrubbed from `human_inbox.json` and never written to the event log or
+`human_replies.json`. Use `KEY=-` to read a secret from stdin (not argv).
+`data/master.key` sits next to `secrets.enc` — encryption-at-rest only helps
+if the key is copied separately; prefer filesystem permissions. Mnemonic
+reveal requires `SOVEREIGN_CONFIRM_REVEAL=1`.
+
+The Claude job crafter is jailed with `Path.relative_to` (not a string prefix)
+and Claude Code allowlists (`Read/Write/Edit/Glob/Grep`; no Bash). Job-board
+text is wrapped as untrusted data. Revenue is recognized when USDC is
+collected, not when an invoice is issued. Live listings without a contact
+email become `needs_channel` instead of mailing `client@unknown.local`.
 
 Sim revenue is a closed marketplace used to prove the loop (invoices still
 exist; they autocollect). Live revenue requires real clients: proposals go
