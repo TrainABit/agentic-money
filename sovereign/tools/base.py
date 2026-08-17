@@ -51,22 +51,22 @@ class Registry:
             for name, t in sorted(self._tools.items())
         }
 
-    def call(self, agent: str, name: str, **kwargs: Any) -> ToolResult:
+    def call(self, caller: str, name: str, **kwargs: Any) -> ToolResult:
         world = self.world
         if world is None:
             return ToolResult(False, error="registry unbound")
         tool = self._tools.get(name)
         if not tool:
             return ToolResult(False, error=f"unknown tool {name}")
-        if not tool.allows(agent):
-            world.store.emit("tool_denied", {"tool": name}, agent)
-            return ToolResult(False, error=f"denied: {agent} cannot use {name}")
+        if not tool.allows(caller):
+            world.store.emit("tool_denied", {"tool": name}, caller)
+            return ToolResult(False, error=f"denied: {caller} cannot use {name}")
         try:
             data = tool.fn(world, **kwargs)
-            world.store.emit("tool", {"tool": name, "ok": True}, agent)
+            world.store.emit("tool", {"tool": name, "ok": True}, caller)
             return ToolResult(True, data=data)
         except Exception as e:
-            world.store.emit("tool", {"tool": name, "ok": False, "error": str(e)[:240]}, agent)
+            world.store.emit("tool", {"tool": name, "ok": False, "error": str(e)[:240]}, caller)
             errs = dict(world.store.get_kv("tool_errors") or {})
             errs[name] = int(errs.get(name, 0)) + 1
             world.store.set_kv("tool_errors", errs)

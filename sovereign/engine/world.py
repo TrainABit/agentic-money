@@ -60,10 +60,10 @@ class World:
         self.freeze_since.pop(agent, None)
         self.store.emit("thaw", {"agent": agent, "reason": reason}, "mechanic")
 
-    def use_tool(self, agent: str, name: str, **kwargs: Any) -> Any:
+    def use_tool(self, caller: str, name: str, **kwargs: Any) -> Any:
         if self.tools is None:
             raise RuntimeError("tools unbound")
-        return self.tools.call(agent, name, **kwargs)
+        return self.tools.call(caller, name, **kwargs)
 
     def persist_kv(self) -> None:
         self.store.set_kv(

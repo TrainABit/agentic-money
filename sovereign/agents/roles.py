@@ -66,7 +66,7 @@ def risk(world: World) -> list[dict[str, Any]]:
         out.append({"kind": "circuit_break", "reason": halt, "broker": world.broker.snapshot()})
     for agent, score in list(world.reputation.scores.items()):
         if score < 20 and agent not in world.frozen:
-            fr = world.use_tool("risk", "governance.freeze", agent=agent, reason=f"rep {score}")
+            fr = world.use_tool("risk", "governance.freeze", target=agent, reason=f"rep {score}")
             if not fr.ok:
                 world.freeze(agent, f"rep {score}")
             out.append({"kind": "rep_freeze", "agent": agent, "score": score})
@@ -83,7 +83,7 @@ def ethics(world: World) -> list[dict[str, Any]]:
         blob = json.dumps(ev).lower()
         if any(s in blob for s in ("mnemonic", "sol_secret", "eth_key", "smtp_pass")):
             world.reputation.slash("operator", 50, "secret leakage")
-            world.use_tool("ethics", "governance.freeze", agent="operator", reason="secret leakage")
+            world.use_tool("ethics", "governance.freeze", target="operator", reason="secret leakage")
             notes.append("secret_leak")
     applies = len(world.store.jobs("applied"))
     accepts = len(world.store.jobs("accepted")) + len(world.store.jobs("paid")) + len(world.store.jobs("invoiced"))

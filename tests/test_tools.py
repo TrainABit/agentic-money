@@ -13,7 +13,7 @@ def test_tool_allow_and_deny(tmp_path):
     hunt = world.use_tool("hunter", "jobs.search", live=False)
     assert hunt.ok
     assert isinstance(hunt.data, list)
-    denied = world.use_tool("hunter", "governance.freeze", agent="closer", reason="no")
+    denied = world.use_tool("hunter", "governance.freeze", target="closer", reason="no")
     assert not denied.ok
     assert "denied" in (denied.error or "")
     events = world.store.events(40)
@@ -27,6 +27,9 @@ def test_tool_allow_and_deny(tmp_path):
     closer_tools = world.tools.available_to("closer")
     assert "brain.complete" in closer_tools
     assert "heal.repair" not in closer_tools
+    wrote = world.use_tool("improver", "playbook.write_trial", agent="closer", body="# trial\n")
+    assert wrote.ok
+    assert (tmp_path / "playbooks" / "closer.trial.md").exists()
 
 
 def test_cli_tools(tmp_path, capsys):
