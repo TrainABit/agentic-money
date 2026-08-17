@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sovereign.memory.store import Store, iso
+from sovereign.memory.store import Store, iso, usd_amount
 
 ACCOUNTS = (
     "assets.cash_usd",
@@ -33,6 +32,7 @@ class Ledger:
         self.store = store
 
         self._bal_cache: dict[str, float] | None = None
+        self._bal_cache_version: tuple[int, int] | None = None
 
     def post(
         self,
@@ -43,21 +43,34 @@ class Ledger:
         ref: str | None = None,
         ts: str | None = None,
     ) -> None:
-        if amount < 0:
+        if float(amount) < 0:
             raise ValueError("amount must be >= 0")
+        amount = usd_amount(amount)
         self._bal_cache = None
+        self._bal_cache_version = None
         self.store.post_ledger(debit, credit, amount, memo, ref, ts=ts)
 
     def balances(self, since: str | None = None) -> dict[str, float]:
-        if since is None and self._bal_cache is not None:
+        if since is not None:
+            return self.store.ledger_balances(since=since)
+        version = self.store.ledger_version()
+        if self._bal_cache is not None and self._bal_cache_version == version:
             return dict(self._bal_cache)
-        bal: dict[str, float] = defaultdict(float)
-        for row in self.store.ledger_rows(since=since):
-            bal[row["debit"]] += float(row["amount"])
-            bal[row["credit"]] -= float(row["amount"])
-        out = dict(bal)
-        if since is None:
-            self._bal_cache = dict(out)
+
+        # Retry if another Store connection commits between the version check
+        # and SQL aggregation; never stamp old balances with a newer version.
+        out: dict[str, float] = {}
+        for _ in range(3):
+            before = self.store.ledger_version()
+            out = self.store.ledger_balances()
+            after = self.store.ledger_version()
+            if before == after:
+                self._bal_cache = dict(out)
+                self._bal_cache_version = after
+                break
+        else:
+            self._bal_cache = None
+            self._bal_cache_version = None
         return out
 
     def balance(self, account: str) -> float:
@@ -74,17 +87,16 @@ class Ledger:
             + b.get("assets.receivable", 0)
         )
         liabilities = sum(-v for k, v in b.items() if k.startswith("liability."))
-        return round(assets - liabilities, 2)
+        return usd_amount(assets - liabilities)
 
     def revenue_by_prefix(self, prefix: str = "income.", since: str | None = None) -> float:
         b = self.balances(since=since)
-        return round(
+        return usd_amount(
             sum(
                 -v
                 for k, v in b.items()
                 if k.startswith(prefix) and not k.endswith("_paper") and "unearned" not in k
-            ),
-            2,
+            )
         )
 
     def trailing_revenue(self, days: int = 30, now: datetime | None = None) -> float:
@@ -94,7 +106,7 @@ class Ledger:
 
     def expenses(self) -> float:
         b = self.balances()
-        return round(sum(v for k, v in b.items() if k.startswith("expenses.")), 2)
+        return usd_amount(sum(v for k, v in b.items() if k.startswith("expenses.")))
 
     def snapshot(self, now: datetime | None = None) -> dict[str, Any]:
         b = self.balances()
@@ -104,9 +116,9 @@ class Ledger:
             "equity_usd": self.equity_usd(),
             "revenue_usd": self.revenue_by_prefix(),
             "trailing_30d_usd": trailing,
-            "labor_usd": round(-b.get("income.labor", 0), 2),
-            "trading_usd": round(-b.get("income.trading", 0), 2),
-            "products_usd": round(-b.get("income.products", 0), 2),
-            "retainers_usd": round(-b.get("income.retainers", 0), 2),
+            "labor_usd": usd_amount(-b.get("income.labor", 0)),
+            "trading_usd": usd_amount(-b.get("income.trading", 0)),
+            "products_usd": usd_amount(-b.get("income.products", 0)),
+            "retainers_usd": usd_amount(-b.get("income.retainers", 0)),
             "expenses_usd": self.expenses(),
         }
