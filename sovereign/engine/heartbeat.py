@@ -46,8 +46,12 @@ def step(world: World) -> dict[str, Any]:
         msg["status"] = "read"
         world.store.upsert_mail(msg)
 
+    if world.comms is not None:
+        world.comms.expire_due(now=world.now)
+
     actions: list[dict[str, Any]] = []
     from sovereign.agents import roles
+    from sovereign.comms.handlers import process_inbox
 
     pipeline = [
         roles.mechanic,
@@ -72,6 +76,11 @@ def step(world: World) -> dict[str, Any]:
         if name in world.frozen:
             world.store.emit("skipped_frozen", {"agent": name}, name)
             continue
+        if world.comms is not None:
+            summaries = process_inbox(world, name)
+            if summaries:
+                # Summaries carry ids/kinds/statuses only, never payload contents.
+                world.store.emit("comms", {"count": len(summaries), "results": summaries}, name)
         try:
             produced = fn(world) or []
         except Exception as e:

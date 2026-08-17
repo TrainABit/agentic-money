@@ -69,6 +69,7 @@ class LiveTiming(BaseModel):
     certification_retry_hours: float = 1.0
     certification_failure_retry_minutes: float = 15.0
     craft_retry_hours: float = 1.0
+    quorum_deadline_hours: float = 24.0
 
 
 class EngineConfig(BaseModel):

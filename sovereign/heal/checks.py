@@ -174,6 +174,19 @@ def diagnose(world: "World") -> list[Finding]:
         repairable=False,
     ))
 
+    comms = getattr(world, "comms", None)
+    if comms is None:
+        out.append(Finding("comms", True, "not wired", repairable=False))
+    else:
+        counts = comms.counts()
+        dead = int(counts.get("dead", 0))
+        out.append(Finding(
+            "comms",
+            ok=dead == 0,
+            detail=f"counts={counts}",
+            repairable=False,
+        ))
+
     return out
 
 

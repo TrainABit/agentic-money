@@ -172,12 +172,27 @@ agent of budget. Improver A/B tests closer playbooks (`closer.md` vs
 `closer.trial.md`) and promotes or reverts from measured accept USD. That is
 self-control and self-improvement.
 
-Agents do not call each other's internals. They call a **permissioned tool
-bus** (`sovereign/tools/catalog.py`). Typical tools: `jobs.search`,
-`mail.send`, `invoice.issue`, `craft.produce`, `heal.repair`,
-`playbook.write_trial`, `governance.freeze`, `brain.complete`. A hunter
-cannot freeze; a closer cannot heal. Denials emit `tool_denied`. Tool
-arguments are never written to the event log (credentials stay in the vault).
+Agents do not call each other's internals. They act through a **permissioned
+tool bus** and talk over a **persistent message bus**. Tool permissions are
+declared once per agent in `sovereign/agents/spec.py` (the same spec that
+pins the system prompt); the registry in `sovereign/tools/catalog.py` derives
+its allowlists from those specs and refuses to start on any drift. Typical
+tools: `jobs.search`, `mail.send`, `invoice.issue`, `craft.produce`,
+`heal.repair`, `playbook.write_trial`, `governance.freeze`,
+`brain.complete`. A hunter cannot freeze; a closer cannot heal. Denials emit
+`tool_denied`. Tool arguments are never written to the event log
+(credentials stay in the vault).
+
+Messages (`sovereign/comms/bus.py`) are durable rows in the shared world:
+one row per recipient, multicast fan-outs joined by a shared
+thread/correlation id, request/reply with mandatory deadlines,
+at-least-once handler retries, and dead-letter events (ids and kinds only,
+never payloads) when retries are exhausted. Example: the operator proposes
+an infra purchase by fanning a `vote_request` out to treasurer, risk, and
+director; each seat votes yes or no strictly by the policy in its spec; the
+council records every vote and requires treasurer-plus-director yes; a seat
+that never answers simply expires at the deadline and the purchase fails
+closed. See [`RUNTIME.md`](RUNTIME.md) for the full protocol.
 
 `sovereign setup` and `sovereign doctor --fix` run the same repair path the
 Mechanic invokes on a bounded cadence: recreate missing paths, migrate sqlite,

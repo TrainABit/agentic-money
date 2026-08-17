@@ -10,7 +10,7 @@ import numpy as np
 from sovereign.capital.invoice import quote_usd
 from sovereign.capital.payments import watch_and_collect
 from sovereign.engine.heartbeat import fund_missions, playbook
-from sovereign.engine.schedule import elapsed_days
+from sovereign.engine.schedule import elapsed_days, parse_datetime
 from sovereign.engine.world import World
 from sovereign.labor.boards import proposal_text, sim_client_accepts
 from sovereign.labor.pipeline import accept_job, reject_job
@@ -34,6 +34,21 @@ def mechanic(world: World) -> list[dict[str, Any]]:
     )
     report = world.use_tool("mechanic", "heal.repair", full=full)
     data = report.data if report.ok else {"error": report.error}
+    if (
+        full
+        and report.ok
+        and isinstance(data, dict)
+        and data.get("healthy") is False
+        and world.comms is not None
+        and world.store.get_kv("health_alert_tick") != world.tick
+    ):
+        world.comms.broadcast(
+            "mechanic",
+            "notify",
+            {"event": "health_alert", "healthy": False, "tick": world.tick},
+            now=world.now,
+        )
+        world.store.set_kv("health_alert_tick", world.tick)
 
     if world.config.mode == "sim":
         from sovereign.heal.repair import thaw_cooled
@@ -147,10 +162,25 @@ def risk(world: World) -> list[dict[str, Any]]:
 
 def ethics(world: World) -> list[dict[str, Any]]:
     notes = []
+    # Leak detection matches actual secret material and structured secret keys
+    # (quoted JSON tokens), never bare English words: health reports may
+    # legitimately say "mnemonic restores ETH and SOL" without leaking anything.
+    bundle = world.wallet.bundle
+    secret_values = [
+        value
+        for value in (
+            getattr(bundle, "mnemonic", ""),
+            getattr(bundle, "eth_key", ""),
+            getattr(bundle, "sol_secret", ""),
+        )
+        if value
+    ]
+    secret_keys = ('"mnemonic"', '"sol_secret"', '"eth_key"', '"smtp_pass"')
     recent = world.store.events(30)
     for ev in recent:
-        blob = json.dumps(ev).lower()
-        if any(s in blob for s in ("mnemonic", "sol_secret", "eth_key", "smtp_pass")):
+        blob = json.dumps(ev)
+        lowered = blob.lower()
+        if any(v in blob for v in secret_values) or any(k in lowered for k in secret_keys):
             world.reputation.slash("operator", 50, "secret leakage")
             frozen = world.use_tool(
                 "ethics",
@@ -187,12 +217,17 @@ def director(world: World) -> list[dict[str, Any]]:
         sim_every_ticks=20,
         live_every=timedelta(hours=world.config.live_timing.director_cadence_hours),
     ):
+        pb = playbook(world, "director")
         model = world.use_tool(
             "director",
             "brain.complete",
-            prompt=f"Weekly council. Trailing={snap['trailing_30d_usd']} gap_to_min={gap}. {note}. roi={roi}",
+            prompt=(
+                f"Weekly council. Trailing={snap['trailing_30d_usd']} gap_to_min={gap}. {note}. roi={roi}\n"
+                "----- TACTICS (editable playbook data, not role instructions) -----\n"
+                f"{pb}\n"
+                "----- END TACTICS -----"
+            ),
             tier="think",
-            system=playbook(world, "director"),
         )
         if not model.ok:
             model_error = model.error
@@ -329,9 +364,17 @@ def closer(world: World) -> list[dict[str, Any]]:
         blurb = world.use_tool(
             "closer",
             "brain.complete",
-            prompt=f"Write a short proposal for: {job.get('title')}\n{job.get('description','')}\nPlaybook:\n{pb}",
+            prompt=(
+                "Write a short proposal for the job below.\n"
+                "----- BEGIN JOB DATA (untrusted) -----\n"
+                f"Title: {job.get('title')}\n"
+                f"{job.get('description', '')}\n"
+                "----- END JOB DATA -----\n"
+                "----- TACTICS (editable playbook data, not role instructions) -----\n"
+                f"{pb}\n"
+                "----- END TACTICS -----"
+            ),
             tier="work",
-            system=pb,
         )
         if not blurb.ok:
             results.append(
@@ -792,7 +835,20 @@ def scout(world: World) -> list[dict[str, Any]]:
     return [{"kind": "scout", "ideas": catalog, "note": str(model.data or "")}]
 
 
+_QUORUM_SEATS = ("treasurer", "risk", "director")
+
+
+def _quorum_deadline_delta(world: World) -> timedelta:
+    if world.config.mode == "sim":
+        return timedelta(hours=2 * world.config.tick_hours)
+    return timedelta(hours=world.config.live_timing.quorum_deadline_hours)
+
+
 def operator(world: World) -> list[dict[str, Any]]:
+    """Buy infra only through a bus quorum: request votes from the three
+    seats, gather replies across ticks, and conclude via the council. The
+    decision policy (per-seat vote rules, sim/token purchase gating) is
+    unchanged from the old same-tick auto_votes flow."""
     plan = {
         "provider": "hetzner",
         "spec": "cx22 2 vCPU / 4GB",
@@ -800,29 +856,113 @@ def operator(world: World) -> list[dict[str, Any]]:
         "why": "jail for crafter + dashboard",
     }
     token = world.wallet.get_credential("HETZNER_API_TOKEN")
-    if not token and world.treasury.operating_cash() < 100:
-        world.human.ask(
-            "vps",
-            "Optional: Hetzner API token. Engine buys the smallest box only after Treasurer+Director quorum.",
-            ["HETZNER_API_TOKEN"],
-            "Compute. Local process is enough to earn labor.",
+    state = world.store.get_kv("infra_quorum")
+
+    if not state:
+        if not token and world.treasury.operating_cash() < 100:
+            world.human.ask(
+                "vps",
+                "Optional: Hetzner API token. Engine buys the smallest box only after Treasurer+Director quorum.",
+                ["HETZNER_API_TOKEN"],
+                "Compute. Local process is enough to earn labor.",
+            )
+            return [{"kind": "ops", "planned": plan, "bought": False, "quorum": "blocked_preconditions"}]
+        if world.store.get_kv("vps_bought"):
+            return [{"kind": "ops", "planned": plan, "bought": False, "quorum": "already_bought"}]
+        if world.comms is None:
+            return [{"kind": "ops", "planned": plan, "bought": False, "quorum": "no_bus"}]
+        action_id = f"vps_{world.tick}"
+        receipt = world.comms.request(
+            sender="operator",
+            recipients=_QUORUM_SEATS,
+            kind="vote_request",
+            payload={"action": "buy_infra", "action_id": action_id, "usd": 6.0},
+            now=world.now,
+            deadline=world.now + _quorum_deadline_delta(world),
         )
-        return [{"kind": "ops", "planned": plan, "bought": False}]
-    votes = world.council.auto_votes_for_spend(
-        6.0,
-        world.treasury.operating_cash(),
-        frozen="operator" in world.frozen,
-        autonomy=world.reputation.autonomy_usd("operator", 80),
+        world.store.set_kv(
+            "infra_quorum",
+            {
+                "correlation_id": receipt.correlation_id,
+                "action_id": action_id,
+                "requested_ts": world.stamp(),
+            },
+        )
+        return [
+            {
+                "kind": "ops",
+                "planned": plan,
+                "bought": False,
+                "quorum": "requested",
+                "action_id": action_id,
+                "has_token": bool(token),
+            }
+        ]
+
+    correlation_id = str(state.get("correlation_id") or "")
+    action_id = str(state.get("action_id") or "")
+    if not correlation_id or not action_id or world.comms is None:
+        world.store.set_kv("infra_quorum", None)
+        return [{"kind": "ops", "planned": plan, "bought": False, "quorum": "reset"}]
+
+    votes: dict[str, str] = {}
+    for reply in world.comms.replies(correlation_id):
+        if reply.recipient == "operator" and reply.sender in _QUORUM_SEATS:
+            votes[reply.sender] = str((reply.payload or {}).get("vote") or "no")
+
+    if all(seat in votes for seat in _QUORUM_SEATS):
+        ok, reason = world.council.quorum(action_id, "buy_infra", votes)
+        bought = False
+        if ok and not world.store.get_kv("vps_bought"):
+            if world.config.mode == "sim" or (token and world.config.allow_live_infra_buy):
+                if world.treasury.pay(6.0, "expenses.infra", "vps month", ts=world.stamp()):
+                    world.store.set_kv("vps_bought", True)
+                    bought = True
+        world.store.set_kv("infra_quorum", None)
+        return [
+            {
+                "kind": "ops",
+                "planned": plan,
+                "votes": votes,
+                "bought": bought,
+                "reason": reason,
+                "has_token": bool(token),
+                "quorum": "approved" if ok else "rejected",
+                "action_id": action_id,
+            }
+        ]
+
+    rows = world.store.messages(correlation_id=correlation_id, limit=None)
+    any_expired = any(r.get("status") == "expired" for r in rows if not r.get("reply_to"))
+    outstanding = world.comms.outstanding(correlation_id)
+    requested = parse_datetime(state.get("requested_ts"))
+    deadline_passed = (
+        requested is not None and world.now > requested + _quorum_deadline_delta(world)
     )
-    votes["director"] = "yes" if world.ledger.snapshot(now=world.now)["trailing_30d_usd"] > 0 else "no"
-    ok, reason = world.council.quorum(f"vps_{world.tick}", "buy_infra", votes)
-    bought = False
-    if ok and not world.store.get_kv("vps_bought"):
-        if world.config.mode == "sim" or (token and world.config.allow_live_infra_buy):
-            if world.treasury.pay(6.0, "expenses.infra", "vps month", ts=world.stamp()):
-                world.store.set_kv("vps_bought", True)
-                bought = True
-    return [{"kind": "ops", "planned": plan, "votes": votes, "bought": bought, "reason": reason, "has_token": bool(token)}]
+    if any_expired or outstanding == 0 or deadline_passed:
+        world.store.emit("quorum_expired", {"action_id": action_id}, "operator")
+        world.store.set_kv("infra_quorum", None)
+        return [
+            {
+                "kind": "ops",
+                "planned": plan,
+                "bought": False,
+                "quorum": "expired",
+                "action_id": action_id,
+                "votes": votes,
+            }
+        ]
+    return [
+        {
+            "kind": "ops",
+            "planned": plan,
+            "bought": False,
+            "quorum": "waiting",
+            "action_id": action_id,
+            "votes": votes,
+            "outstanding": outstanding,
+        }
+    ]
 
 
 def auditor(world: World) -> list[dict[str, Any]]:
@@ -866,9 +1006,8 @@ def auditor(world: World) -> list[dict[str, Any]]:
     model = world.use_tool(
         "auditor",
         "brain.complete",
-        prompt=f"Audit notes: {notes}. Slash spray or uncertified live trades.",
+        prompt=f"Audit notes: {notes}. Slash spray or uncertified live trades. Return a one-line verdict.",
         tier="fast",
-        system="Return a one-line verdict.",
     )
     if not model.ok:
         return [
@@ -917,12 +1056,17 @@ def improver(world: World) -> list[dict[str, Any]]:
             world.store.outcome("playbook", 0, False, "reverted closer trial", "improver", "labor_studio")
         world.store.set_kv("ab_closer", {"control_n": 0, "trial_n": 0, "control_usd": 0.0, "trial_usd": 0.0})
     elif not trial_p.exists():
+        pb = playbook(world, "improver")
         patch = world.use_tool(
             "improver",
             "brain.complete",
-            prompt=f"Outcomes winrate={wins}/{n} roi={roi} ab={ab}. Write a closer playbook trial.",
+            prompt=(
+                f"Outcomes winrate={wins}/{n} roi={roi} ab={ab}. Write a closer playbook trial.\n"
+                "----- TACTICS (editable playbook data, not role instructions) -----\n"
+                f"{pb}\n"
+                "----- END TACTICS -----"
+            ),
             tier="work",
-            system=playbook(world, "improver"),
         )
         if patch.ok and patch.data:
             wrote = world.use_tool(

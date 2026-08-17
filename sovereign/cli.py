@@ -9,10 +9,12 @@ from pathlib import Path
 
 import yaml
 
+from sovereign.agents.spec import AGENT_SPECS, spec_for
 from sovereign.config import EngineConfig
 from sovereign.engine.heartbeat import step
 from sovereign.engine.world import bootstrap, load_prices
 from sovereign.markets.data import certify, fetch_closes
+from sovereign.ops import readiness
 
 
 def _config(args: argparse.Namespace) -> EngineConfig:
@@ -40,6 +42,27 @@ def cmd_init(args: argparse.Namespace) -> int:
     world = bootstrap(_config(args))
     print(json.dumps({"ok": True, "identity": world.identity, "wallet": world.wallet.public()}, indent=2))
     return 0
+
+
+def cmd_bootstrap(args: argparse.Namespace) -> int:
+    world = bootstrap(_config(args))
+    from sovereign.heal.repair import setup as heal_setup
+
+    heal_setup(world, full=True)
+    world.persist_kv()
+    report = readiness(world)
+    print(
+        json.dumps(
+            {
+                "readiness": report,
+                "identity": world.identity,
+                "wallet": world.wallet.public(),
+            },
+            indent=2,
+            default=str,
+        )
+    )
+    return 0 if report["ready"] else 1
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -192,6 +215,42 @@ def cmd_tools(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_agents(args: argparse.Namespace) -> int:
+    world = bootstrap(_config(args))
+
+    def entry(name: str, *, with_prompt: bool) -> dict[str, object]:
+        spec = spec_for(name)
+        tools = (
+            world.tools.available_to(name)
+            if world.tools is not None
+            else sorted(spec.tools)
+        )
+        item: dict[str, object] = {
+            "name": spec.name,
+            "mission": spec.mission,
+            "tier": spec.tier,
+            "tools": tools,
+            "handles": list(spec.handles),
+            "frozen": name in world.frozen,
+            "inbox_queued": len(
+                world.store.messages(recipient=name, status="queued", limit=None)
+            ),
+        }
+        if with_prompt:
+            item["system_prompt"] = spec.system_prompt
+        return item
+
+    if args.agent:
+        if args.agent not in AGENT_SPECS:
+            raise KeyError(
+                f"unknown agent {args.agent!r}; roster: {', '.join(sorted(AGENT_SPECS))}"
+            )
+        print(json.dumps(entry(args.agent, with_prompt=True), indent=2))
+    else:
+        print(json.dumps([entry(n, with_prompt=False) for n in sorted(AGENT_SPECS)], indent=2))
+    return 0
+
+
 def cmd_dashboard(args: argparse.Namespace) -> int:
     from sovereign.dashboard.app import serve
 
@@ -272,6 +331,10 @@ def build_parser() -> argparse.ArgumentParser:
     _globals(s)
     s.set_defaults(func=cmd_init)
 
+    s = sub.add_parser("bootstrap", help="One-shot init + full repair + readiness report")
+    _globals(s)
+    s.set_defaults(func=cmd_bootstrap)
+
     s = sub.add_parser("run", help="Run heartbeat ticks")
     _globals(s)
     s.add_argument("--ticks", type=int, default=24)
@@ -312,6 +375,11 @@ def build_parser() -> argparse.ArgumentParser:
     _globals(s)
     s.add_argument("--agent", default=None)
     s.set_defaults(func=cmd_tools)
+
+    s = sub.add_parser("agents", help="Roster: mission, tier, tools, handles, freeze, inbox")
+    _globals(s)
+    s.add_argument("--agent", default=None, help="One agent, including its full system prompt")
+    s.set_defaults(func=cmd_agents)
 
     s = sub.add_parser("dashboard", help="Read-only observer UI")
     _globals(s)

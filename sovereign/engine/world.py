@@ -44,6 +44,7 @@ class World:
     freeze_since: dict[str, int] = field(default_factory=dict)
     freeze_info: dict[str, dict[str, Any]] = field(default_factory=dict)
     tools: Any = None
+    comms: Any = None
     clock: Clock = field(default_factory=SystemClock)
     scheduler: Scheduler = field(init=False)
 
@@ -276,6 +277,7 @@ class World:
             "pipeline": counts,
             "invoices_open": len(self.store.invoices("open")),
             "invoices_paid": len(self.store.invoices("paid")),
+            "comms": self.comms.counts() if self.comms is not None else None,
             "offers": self.store.offers(),
             "mail_out": len(self.store.mail(direction="out")),
             "mail_in": len(self.store.mail(direction="in")),
@@ -365,10 +367,13 @@ def bootstrap(config: EngineConfig, *, heal: bool = True, clock: Clock | None = 
             "born": iso(initial_now),
         },
     )
+    from sovereign.agents.spec import roster
+    from sovereign.comms.bus import Bus
     from sovereign.tools.catalog import build_registry
 
     world.tools = build_registry()
     world.tools.bind(world)
+    world.comms = Bus(store, roster())
     if store.get_kv("meta"):
         world.load_kv()
         world.identity.setdefault("name", config.firm_name)

@@ -6,7 +6,12 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from sovereign.engine.world import World
 
-DEFAULT_PLAYBOOKS: dict[str, str] = {
+_PREFACE = "Tactical playbook (editable data layered under the fixed system prompt).\n"
+
+# Short, editable TACTICS layered under the fixed system prompts defined in
+# sovereign.agents.spec. Every "Tools:" line may only name tools the agent's
+# spec actually grants (tests/test_agent_specs.py enforces this).
+_TACTICS: dict[str, str] = {
     "hunter": (
         "# Hunter\n"
         "- Score jobs against skills. Ignore anything below fit 0.45 unless Director starved.\n"
@@ -97,6 +102,8 @@ DEFAULT_PLAYBOOKS: dict[str, str] = {
         "- Tools: offers.list, brain.complete, ledger.snapshot\n"
     ),
 }
+
+DEFAULT_PLAYBOOKS: dict[str, str] = {name: _PREFACE + body for name, body in _TACTICS.items()}
 
 
 def seed_playbooks(dir_path: Path) -> None:
