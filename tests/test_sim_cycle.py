@@ -32,6 +32,11 @@ def test_full_sim_cycle_earns(tmp_path):
     assert "direct" in kinds
     assert "treasury" in kinds
     assert "ethics" in kinds
+    assert "mechanic" in kinds
+    assert "snapshot" in kinds
+    assert status["tools"] and "jobs.search" in status["tools"]["names"]
+    assert "heal.repair" in status["tools"]["by_agent"]["mechanic"]
+    assert world.store.get_kv("health")
     # Crafter wrote real files, not only a markdown blob
     crafted = [j for j in paid if j.get("files")]
     assert crafted
@@ -51,3 +56,8 @@ def test_dashboard_readonly(tmp_path):
     assert "pipeline" in body
     j = client.get("/api/jobs")
     assert j.status_code == 200
+    h = client.get("/api/health")
+    assert h.status_code == 200
+    t = client.get("/api/tools")
+    assert t.status_code == 200
+    assert "jobs.search" in t.json()

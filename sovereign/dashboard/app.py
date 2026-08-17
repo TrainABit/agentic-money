@@ -59,6 +59,10 @@ HTML = """<!doctype html>
     <h2>Agents</h2>
     <pre id="agents"></pre>
   </section>
+  <section>
+    <h2>Health / tools</h2>
+    <pre id="health"></pre>
+  </section>
   <section style="grid-column: 1 / -1">
     <h2>Recent events</h2>
     <pre id="events"></pre>
@@ -83,6 +87,8 @@ async function tick(){
   document.getElementById('inv').textContent = JSON.stringify({open:s.invoices_open, paid:s.invoices_paid, offers:s.offers}, null, 2);
   document.getElementById('strat').textContent = JSON.stringify({certified:s.certified_strategies, rejected:s.rejected_strategies}, null, 2);
   document.getElementById('agents').textContent = JSON.stringify({frozen:s.frozen_agents, reputation:s.reputation, broker:s.broker}, null, 2);
+  const toolCount = (s.tools && s.tools.names) ? s.tools.names.length : 0;
+  document.getElementById('health').textContent = JSON.stringify({health:s.health, tools: toolCount, skills:s.skills}, null, 2);
   document.getElementById('events').textContent = JSON.stringify(s.recent_events.slice(0,12), null, 2);
 }
 tick(); setInterval(tick, 3000);
@@ -112,6 +118,18 @@ def create_app(data_dir: str, mode: str) -> FastAPI:
     @app.get("/api/jobs")
     def jobs() -> JSONResponse:
         return JSONResponse(world().store.jobs())
+
+    @app.get("/api/health")
+    def health() -> JSONResponse:
+        w = world()
+        return JSONResponse(w.store.get_kv("health") or {})
+
+    @app.get("/api/tools")
+    def tools() -> JSONResponse:
+        w = world()
+        if w.tools is None:
+            return JSONResponse({"names": []})
+        return JSONResponse(w.tools.manifest())
 
     return app
 

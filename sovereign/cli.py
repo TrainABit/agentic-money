@@ -118,12 +118,51 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     claude = shutil.which(cfg.models.claude_bin)
     add(bool(claude), "claude_cli", claude or "not on PATH — run sim, or install Claude Code and `claude login`")
     world = bootstrap(cfg)
+    from sovereign.heal.checks import diagnose
+    from sovereign.heal.repair import setup as heal_setup
+
     add(True, "wallet_eth", world.wallet.public()["eth_address"])
     add(True, "wallet_sol", world.wallet.public()["sol_address"])
     add(world.router.claude.available(), "subscription_cognition", world.router.provider_name())
     add(True, "human_inbox_open", str(len(world.human.open())))
-    print(json.dumps(checks, indent=2))
-    return 0 if all(c["ok"] or c["name"] in {"claude_cli", "subscription_cognition"} for c in checks) else 1
+    add(world.tools is not None, "tools_bound", str(len(world.tools.names()) if world.tools else 0))
+    findings = diagnose(world)
+    if getattr(args, "fix", False):
+        health = heal_setup(world, full=True)
+        world.persist_kv()
+    else:
+        health = {
+            "healthy": all(f.ok for f in findings),
+            "findings": [f.as_dict() for f in findings],
+            "repairs": [],
+        }
+    print(json.dumps({"checks": checks, "health": health}, indent=2, default=str))
+    health_ok = bool(health.get("healthy"))
+    checks_ok = all(c["ok"] or c["name"] in {"claude_cli", "subscription_cognition"} for c in checks)
+    return 0 if checks_ok and (health_ok or not getattr(args, "fix", False)) else 1
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    world = bootstrap(_config(args))
+    from sovereign.heal.repair import setup as heal_setup
+
+    report = heal_setup(world, full=True)
+    world.persist_kv()
+    print(json.dumps(report, indent=2, default=str))
+    return 0 if report.get("healthy") else 1
+
+
+def cmd_tools(args: argparse.Namespace) -> int:
+    world = bootstrap(_config(args))
+    if world.tools is None:
+        print(json.dumps({"ok": False, "error": "tools unbound"}, indent=2))
+        return 1
+    agent = getattr(args, "agent", None)
+    if agent:
+        print(json.dumps({"agent": agent, "tools": world.tools.available_to(agent)}, indent=2))
+    else:
+        print(json.dumps(world.tools.manifest(), indent=2))
+    return 0
 
 
 def cmd_dashboard(args: argparse.Namespace) -> int:
@@ -221,9 +260,19 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("field", nargs="+", help="KEY=VALUE")
     s.set_defaults(func=cmd_reply)
 
-    s = sub.add_parser("doctor", help="Check subscription CLI, wallet, inbox")
+    s = sub.add_parser("doctor", help="Check subscription CLI, wallet, inbox, engine health")
     _globals(s)
+    s.add_argument("--fix", action="store_true", help="Repair what the mechanic can repair")
     s.set_defaults(func=cmd_doctor)
+
+    s = sub.add_parser("setup", help="Idempotent engine repair (paths, playbooks, inbox, lock, tools)")
+    _globals(s)
+    s.set_defaults(func=cmd_setup)
+
+    s = sub.add_parser("tools", help="List the tool bus (optionally for one agent)")
+    _globals(s)
+    s.add_argument("--agent", default=None)
+    s.set_defaults(func=cmd_tools)
 
     s = sub.add_parser("dashboard", help="Read-only observer UI")
     _globals(s)

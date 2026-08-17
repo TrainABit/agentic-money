@@ -132,11 +132,12 @@ That is compatible with Max; on Pro, cut proposals and serialize deliveries.
           │               │                │                │
      ┌────┴────┬──────────┴───┬────────────┴─────┬──────────┴─────┐
   Hunter    Closer        Crafter           Trader         Publisher
-  Scout     Operator      Courier           Bookkeeper
+  Scout     Operator      Courier           Bookkeeper     Mechanic
 ```
 
 | Agent | Job | Model | Who can freeze / slash them |
 | --- | --- | --- | --- |
+| Mechanic | Diagnose/repair engine, thaw cooled agents | none | Director+Auditor |
 | Director | Allocate attention and capital to plays that move $2k/$5k/$7k | think (weekly), else none | Auditor+Risk+Treasurer supermajority |
 | Treasurer | Budgets, invoices, wallet sweeps, allocation | none / fast | Risk + Director |
 | Risk | Circuit breakers, exposure, strategy certification gate | none | Director+Auditor (rare) |
@@ -160,12 +161,28 @@ No human approval. High-impact actions need **agent quorum**:
 | Live trade | Certified strategy + Risk not frozen + within loss caps |
 | Buy infra | Treasurer + Director |
 | Outbound email / apply | Courier policy (no spam, no impersonation fraud) |
-| Promote playbook | Improver + Auditor |
-| Unfreeze an agent | Risk + Director |
+| Promote playbook | Improver after A/B (trial USD > control × 1.05, n≥6 each) |
+| Unfreeze an agent | Mechanic after cooldown if reputation ≥ 20; else Risk + Director |
 | Remove Director | Treasurer + Risk + Auditor |
 
 Reputation (0–100) scales autonomy. Repeated Auditor slashes starve a bad
-agent of budget. Improver can replace its playbook. That is self-control.
+agent of budget. Improver A/B tests closer playbooks (`closer.md` vs
+`closer.trial.md`) and promotes or reverts from measured accept USD. That is
+self-control and self-improvement.
+
+Agents do not call each other's internals. They call a **permissioned tool
+bus** (`sovereign/tools/catalog.py`). Typical tools: `jobs.search`,
+`mail.send`, `invoice.issue`, `craft.produce`, `heal.repair`,
+`playbook.write_trial`, `governance.freeze`, `brain.complete`. A hunter
+cannot freeze; a closer cannot heal. Denials emit `tool_denied`. Tool
+arguments are never written to the event log (credentials stay in the vault).
+
+`sovereign setup` and `sovereign doctor --fix` run the same repair path the
+Mechanic runs every tick: recreate missing paths, migrate sqlite, reseed
+playbooks, reset a corrupt human inbox, drop a stale lock, rebind tools,
+recertify strategies, sync the paper broker. The daemon (`sovereign serve`)
+runs a full heal on start and after a crashed tick, then continues. Other
+plays keep running while a login sits in the inbox.
 
 ---
 
@@ -312,23 +329,25 @@ expected value → defund. Scout must replace it.
 
 Every tick:
 
-1. Bookkeeper snapshots balances and 30-day run-rate vs $2k/$5k/$7k.
-2. Risk applies freezes (drawdown, error rate, ethics flags).
-3. Director assigns/renews missions from funded plays.
-4. Workforce acts in parallel: Hunter, Trader, Publisher, Scout, Operator.
-5. Closer on leads; Crafter on accepted jobs.
-6. Treasurer settles invoices, refuses over-budget spends.
-7. Auditor samples; slashes or boosts reputation.
-8. Improver, if enough outcomes, writes a playbook trial.
-9. Courier emits human login requests if a play is blocked on credentials.
+1. Mechanic diagnoses and repairs the engine (paths, playbooks, inbox, lock, tools), then thaws agents whose cooldown elapsed.
+2. Bookkeeper snapshots balances and 30-day run-rate vs $2k/$5k/$7k.
+3. Risk applies freezes (drawdown, error rate, ethics flags) without resetting an existing freeze clock.
+4. Director assigns/renews missions from funded plays.
+5. Workforce acts in parallel: Hunter, Trader, Publisher, Scout, Operator — through the tool bus.
+6. Closer on leads (A/B playbook); Crafter on accepted jobs.
+7. Treasurer settles invoices, refuses over-budget spends.
+8. Auditor samples; slashes or boosts reputation.
+9. Improver, if enough A/B outcomes, promotes or reverts the closer trial.
+10. Courier emits human login requests if a play is blocked on credentials.
    **Other plays continue.** Nothing global-halts for a login except Claude
    itself in live cognition mode (sim brain still runs).
-10. Persist. Sleep. Repeat.
+11. Persist. Sleep. Repeat.
 
-Self-improvement: every delivery and trade writes an Outcome. Improver
-clusters failures ("proposals too generic", "missed scope") and patches
-the playbook. Auditor A/B tests. Winners promote. That is the firm getting
-smarter without you.
+Self-improvement: every delivery and trade writes an Outcome and a skill
+counter. Improver writes a `closer.trial.md`, the closer is split 50/50,
+accept USD is attributed to trial vs control, and after ≥6 uses each the
+trial is promoted (>5% better) or reverted. Auditor still samples
+deliveries. That is the firm getting smarter without you.
 
 ---
 
@@ -384,22 +403,31 @@ Every tick, in order:
 1. Advance the clock (sim: +`tick_hours`; live: wall clock).
 2. Consume human replies into the encrypted credential vault (values never enter the event log).
 3. Ingest `data/mail/inbox/*.json` and accept/reject/paid jobs from language.
-4. Bookkeeper snapshots **trailing 30-day** revenue vs $2k/$5k/$7k.
-5. Risk + Ethics freeze/slash.
+4. Mechanic heals the engine, then Bookkeeper snapshots **trailing 30-day** revenue vs $2k/$5k/$7k.
+5. Risk + Ethics freeze/slash (freeze clock is sticky so Mechanic can thaw after cooldown).
 6. Director funds plays using attention **blended with measured ROI**.
-7. Hunter (sim catalog or live public boards — never mixed).
-8. Closer quotes, writes a proposal, **sends mail** (SMTP if injected, else local outbox).
-9. Crafter produces a **file tree** (script/html/memo) in `data/work/<job>` and, in live with Claude Code, runs `claude -p` jailed to that directory.
-10. Treasurer **issues a USDC invoice** (receivable) instead of silently minting cash. Sim autocollects; live watches the ETH USDC balance or `sovereign paid`.
+7. Hunter (sim catalog or live public boards — never mixed) via `jobs.search`.
+8. Closer quotes, writes a proposal with A/B playbook, **sends mail** (`mail.send`; SMTP if injected, else local outbox).
+9. Crafter produces a **file tree** (script/html/memo) in `data/work/<job>` via `craft.produce` and, in live with Claude Code, runs `claude -p` jailed to that directory.
+10. Treasurer **issues a USDC invoice** (`invoice.issue`) instead of silently minting cash. Sim autocollects; live watches the ETH USDC balance or `sovereign paid`.
 11. Trader only if certified + funded + not frozen.
 12. Publisher/Scout list offers and retainers. Operator may buy infra after quorum.
-13. Auditor samples deliveries. Improver patches playbooks and can starve zero-EV plays.
+13. Auditor samples deliveries. Improver A/B-promotes or reverts closer playbooks and can starve zero-EV plays.
 14. Courier keeps login requests open. Persist sqlite. Sleep. Repeat.
 
 Daemon: `sovereign serve` takes a file lock so two hearts cannot beat.
+On start and after a crashed tick it runs `heal.repair` (full) and continues.
+
+Setup: `sovereign setup` / `doctor --fix` is the same repair path. Use it
+when a playbook is missing, the inbox JSON is corrupt, or a dead PID left
+`engine.lock` behind.
 
 ## 11. What "done enough to run" looks like
 
+- Mechanic + `sovereign setup` that repairs a broken engine without a human.
+- Permissioned tool bus so every bot has the tools it needs and cannot use the others'.
+- A/B self-improve (promote/revert closer playbooks from accept USD).
+- Freeze cooldown + thaw so a slashed agent is not dead forever.
 - Plan + org + plays (this file).
 - Sim cycle that invoices, mails, crafts files, and collects.
 - Live cycle that can apply → wait → accept → deliver → invoice → collect without autocollect.

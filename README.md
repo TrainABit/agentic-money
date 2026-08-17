@@ -25,11 +25,13 @@ Read the full plan: [`docs/PLAN.md`](docs/PLAN.md) · plays: [`docs/PLAYS.md`](d
 ```bash
 pip install -e ".[dev]"
 sovereign init
-sovereign doctor
+sovereign setup                          # repair paths, playbooks, inbox, lock, tools
+sovereign doctor --fix                   # same heal + CLI/wallet checks
+sovereign tools --agent mechanic         # permissioned tool bus
 sovereign run --ticks 30                 # sim marketplace + paper trading
-sovereign serve --mode live              # daemon, file-locked, crash-safe
+sovereign serve --mode live              # daemon, file-locked, crash-heals
 sovereign backtest --live-data           # certify strategies on public BTC
-sovereign dashboard                      # observer: pipeline, invoices, wallets
+sovereign dashboard                      # observer: pipeline, invoices, wallets, health
 ```
 
 Live labor loop (no auto-pay):
@@ -47,12 +49,25 @@ sovereign paid inv_...                   # or it marks paid when USDC arrives
 ## What is running
 
 ```
+Mechanic (first) → diagnose/repair/thaw → other agents keep working
 Director → funds plays by trailing-30d ROI
 Treasurer / Risk / Auditor / Ethics / Improver → mutual control
 Hunter → Closer → mail outbox → accept → Crafter (real files, Claude jail) → invoice → USDC
 Trader → certified TSMOM only, walled book, circuit breakers
 Publisher / Scout / Operator / Courier / Bookkeeper
 ```
+
+Every agent calls a **permissioned tool bus** (`jobs.*`, `mail.*`, `invoice.*`,
+`heal.*`, `playbook.*`, `governance.freeze/thaw`, `brain.complete`). A hunter
+cannot freeze anyone. A closer cannot run `heal.repair`. Denials are audited;
+tool kwargs (secrets) are not logged.
+
+The firm runs without you. Ordinary work has no approval queue. If sqlite
+paths, playbooks, the human inbox, a stale lock, or the tool registry break,
+**Mechanic** repairs them every tick. `sovereign setup` / `doctor --fix` do
+the same on demand. The daemon heals and continues after a crashed tick.
+Frozen agents thaw after a cooldown if reputation recovers. Improver A/B
+tests closer playbooks and promotes or reverts from measured USD.
 
 Wallets (ETH + SOL) are generated at init and encrypted at rest. Credentials
 injected via `sovereign reply` land in the same vault and are never written
