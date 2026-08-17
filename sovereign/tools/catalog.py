@@ -7,8 +7,9 @@ from sovereign.channels import mail as mailbox
 from sovereign.labor.craft import produce
 from sovereign.labor.pipeline import accept_job
 from sovereign.markets.data import certify
+from sovereign.memory.playbooks import DEFAULT_PLAYBOOKS
+from sovereign.security import job_child, safe_child, validate_job_id
 from sovereign.tools.base import Registry, Tool
-
 
 ALL = frozenset({"*"})
 LABOR = frozenset({"hunter", "closer", "crafter", "treasurer", "auditor", "director", "bookkeeper", "courier"})
@@ -40,7 +41,7 @@ def build_registry() -> Registry:
            lambda w, direction=None: w.store.mail(direction=direction)),
         _t("invoice.issue", "Issue a USDC invoice", frozenset({"treasurer"}),
            lambda w, job, income_account="income.labor": invoices.issue(w, job, income_account=income_account)),
-        _t("invoice.collect", "Mark invoice paid / settle receivable", frozenset({"treasurer", "mechanic"}),
+        _t("invoice.collect", "Mark invoice paid / settle receivable", frozenset({"treasurer"}),
            lambda w, ref, source="tool": invoices.collect(w, ref, source=source)),
         _t("invoice.list", "List invoices", frozenset({"treasurer", "bookkeeper", "auditor", "director", "mechanic"}),
            lambda w, status=None: w.store.invoices(status)),
@@ -64,7 +65,7 @@ def build_registry() -> Registry:
         _t("playbook.promote", "Promote trial playbook to control", frozenset({"improver", "auditor"}),
            lambda w, agent: _promote(w, agent)),
         _t("governance.freeze", "Freeze an agent", frozenset({"risk", "ethics", "mechanic", "auditor"}),
-           lambda w, target, reason: w.freeze(target, reason)),
+           lambda w, target, reason, kind=None: w.freeze(target, reason, kind=kind)),
         _t("governance.thaw", "Thaw a frozen agent", frozenset({"mechanic", "risk", "director"}),
            lambda w, target, reason: w.thaw(target, reason)),
         _t("memory.kv_get", "Read kv memory", GOV | frozenset({"bookkeeper"}),
@@ -92,8 +93,9 @@ def _reject(w, job_id: str, source: str = "tool"):
 
 
 def _certify(w) -> list[dict[str, Any]]:
-    from sovereign.engine.world import ensure_certified, load_prices
     import numpy as np
+
+    from sovereign.engine.world import load_prices
 
     w.certified = []
     load_prices(w)
@@ -106,11 +108,14 @@ def _certify(w) -> list[dict[str, Any]]:
 def _read_pb(w, agent: str, job_id=None) -> str:
     from sovereign.memory.playbooks import read_playbook_ab
 
-    return read_playbook_ab(w, agent, job_id)
+    agent = _playbook_agent(agent)
+    clean_job_id = validate_job_id(job_id) if job_id is not None else None
+    return read_playbook_ab(w, agent, clean_job_id)
 
 
 def _write_trial(w, agent: str, body: str) -> str:
-    path = w.config.paths().playbooks / f"{agent}.trial.md"
+    agent = _playbook_agent(agent)
+    path = safe_child(w.config.paths().playbooks, f"{agent}.trial.md", label="playbook")
     path.write_text(body)
     return str(path)
 
@@ -118,7 +123,13 @@ def _write_trial(w, agent: str, body: str) -> str:
 def _promote(w, agent: str) -> bool:
     from sovereign.memory.playbooks import promote_trial
 
-    return promote_trial(w.config.paths().playbooks, agent)
+    return promote_trial(w.config.paths().playbooks, _playbook_agent(agent))
+
+
+def _playbook_agent(agent: object) -> str:
+    if not isinstance(agent, str) or agent not in DEFAULT_PLAYBOOKS:
+        raise ValueError("invalid playbook agent")
+    return agent
 
 
 def _diagnose(w) -> dict[str, Any]:
@@ -134,7 +145,7 @@ def _repair(w, full: bool = False) -> dict[str, Any]:
 
 
 def _list_work(w, job_id: str) -> list[str]:
-    p = w.config.paths().work / job_id
+    p = job_child(w.config.paths().work, job_id)
     if not p.exists():
         return []
-    return [x.name for x in p.iterdir() if x.is_file()]
+    return sorted(x.name for x in p.iterdir() if x.is_file() and not x.is_symlink())

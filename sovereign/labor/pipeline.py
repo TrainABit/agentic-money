@@ -1,17 +1,31 @@
 from __future__ import annotations
 
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+from sovereign.security import validate_job_id
 
 if TYPE_CHECKING:
     from sovereign.engine.world import World
 
 
-def accept_job(world: "World", job_id: str, source: str = "manual") -> dict[str, Any]:
+ACCEPT_FROM = frozenset({"open", "applied", "proposed", "queued_budget", "needs_channel"})
+ACCEPTED_OR_LATER = frozenset({"accepted", "in_progress", "delivered", "invoiced", "paid"})
+REJECT_FROM = frozenset({"open", "applied", "proposed", "queued_budget", "needs_channel", "accepted"})
+TERMINAL_OR_PROTECTED = frozenset(
+    {"rejected", "expired", "cancelled", "in_progress", "delivered", "invoiced", "paid", "refunded", "void"}
+)
+
+
+def accept_job(world: World, job_id: str, source: str = "manual") -> dict[str, Any]:
+    job_id = validate_job_id(job_id)
     job = world.store.get_job(job_id)
     if not job:
         raise KeyError(job_id)
-    if job.get("status") in {"accepted", "in_progress", "delivered", "invoiced", "paid"}:
+    status = str(job.get("status") or "open").lower()
+    if status in ACCEPTED_OR_LATER or status in TERMINAL_OR_PROTECTED:
         return job
+    if status not in ACCEPT_FROM:
+        raise ValueError(f"cannot accept job from status {status!r}")
     job["status"] = "accepted"
     job["accepted_via"] = source
     variant = job.get("ab_variant")
@@ -30,10 +44,16 @@ def accept_job(world: "World", job_id: str, source: str = "manual") -> dict[str,
     return job
 
 
-def reject_job(world: "World", job_id: str, source: str = "manual") -> dict[str, Any]:
+def reject_job(world: World, job_id: str, source: str = "manual") -> dict[str, Any]:
+    job_id = validate_job_id(job_id)
     job = world.store.get_job(job_id)
     if not job:
         raise KeyError(job_id)
+    status = str(job.get("status") or "open").lower()
+    if status in TERMINAL_OR_PROTECTED:
+        return job
+    if status not in REJECT_FROM:
+        raise ValueError(f"cannot reject job from status {status!r}")
     job["status"] = "rejected"
     job["rejected_via"] = source
     world.store.upsert_job(job)
