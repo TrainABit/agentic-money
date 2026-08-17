@@ -1,0 +1,11 @@
+{
+  "name": "agentic-money",
+  "install": "npm ci",
+  "terminals": [
+    {
+      "name": "dev-server",
+      "command": "npm run dev"
+    }
+  ],
+  "ports": [3000]
+}

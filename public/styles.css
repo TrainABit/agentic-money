@@ -1,0 +1,279 @@
+:root {
+  --bg: #0f1220;
+  --panel: #191d31;
+  --panel-2: #222741;
+  --text: #e7e9f3;
+  --muted: #9aa0bd;
+  --accent: #6c8cff;
+  --income: #4ade80;
+  --spending: #fb7185;
+  --warning: #fbbf24;
+  --danger: #f87171;
+  --success: #34d399;
+  --info: #60a5fa;
+  --radius: 14px;
+  font-family: "Inter", system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: radial-gradient(1200px 600px at 80% -10%, #26305c 0%, var(--bg) 55%);
+  color: var(--text);
+  min-height: 100vh;
+}
+
+.topbar {
+  padding: 28px 32px 8px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.logo {
+  font-size: 28px;
+  color: var(--accent);
+}
+
+.brand h1 {
+  margin: 0;
+  font-size: 26px;
+  letter-spacing: -0.02em;
+}
+
+.tagline {
+  margin: 6px 0 0;
+  color: var(--muted);
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+  padding: 20px 32px 48px;
+  max-width: 1080px;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid #2a2f4d;
+  border-radius: var(--radius);
+  padding: 20px;
+}
+
+.panel h2 {
+  margin: 0 0 14px;
+  font-size: 16px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.stats {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 18px;
+}
+
+.stat {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.stat-label {
+  color: var(--muted);
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.stat-value {
+  font-size: 30px;
+  font-weight: 700;
+}
+
+.stat-value.income {
+  color: var(--income);
+}
+
+.stat-value.spending {
+  color: var(--spending);
+}
+
+.txn-form {
+  display: grid;
+  grid-template-columns: 2fr 1fr auto;
+  gap: 10px;
+}
+
+input {
+  background: var(--panel-2);
+  border: 1px solid #333a5f;
+  color: var(--text);
+  padding: 11px 12px;
+  border-radius: 10px;
+  font-size: 14px;
+}
+
+input:focus {
+  outline: 2px solid var(--accent);
+  border-color: transparent;
+}
+
+button {
+  background: var(--accent);
+  color: white;
+  border: 0;
+  padding: 11px 20px;
+  border-radius: 10px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button:hover {
+  filter: brightness(1.08);
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 12px 0 0;
+}
+
+.insights {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.insight {
+  padding: 12px 14px;
+  border-radius: 10px;
+  font-size: 14px;
+  border-left: 4px solid var(--info);
+  background: var(--panel-2);
+}
+
+.insight.warning {
+  border-color: var(--warning);
+}
+.insight.danger {
+  border-color: var(--danger);
+}
+.insight.success {
+  border-color: var(--success);
+}
+.insight.info {
+  border-color: var(--info);
+}
+
+.categories {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.category {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.category-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 14px;
+}
+
+.category-name {
+  text-transform: capitalize;
+  font-weight: 600;
+}
+
+.category-amount {
+  color: var(--muted);
+}
+
+.bar {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  overflow: hidden;
+}
+
+.bar-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 999px;
+}
+
+.bar-fill.over {
+  background: var(--danger);
+}
+
+.transactions {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.txn {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 4px 12px;
+  padding: 10px 12px;
+  background: var(--panel-2);
+  border-radius: 10px;
+}
+
+.txn-desc {
+  font-weight: 600;
+}
+
+.txn-cat {
+  grid-row: 2;
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: capitalize;
+}
+
+.txn-amount {
+  grid-row: 1 / span 2;
+  align-self: center;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.txn-amount.pos {
+  color: var(--income);
+}
+.txn-amount.neg {
+  color: var(--spending);
+}
+
+@media (max-width: 720px) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+  .txn-form {
+    grid-template-columns: 1fr;
+  }
+  .stats {
+    grid-template-columns: 1fr;
+  }
+}
