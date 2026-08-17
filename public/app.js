@@ -1,16 +1,33 @@
 const fmt = (value) =>
   `${value < 0 ? "-" : ""}$${Math.abs(value).toFixed(2)}`;
 
-async function api(path, options) {
+const byId = (id) => document.getElementById(id);
+const TRANSACTION_PAGE_SIZE = 20;
+let apiToken = "";
+let transactionOffset = 0;
+let currentTransactionPagination = {
+  limit: TRANSACTION_PAGE_SIZE,
+  offset: 0,
+  total: 0,
+  hasMore: false,
+};
+
+async function api(path, options = {}) {
+  const headers = { Accept: "application/json", ...options.headers };
+  if (options.body !== undefined) headers["Content-Type"] = "application/json";
+  if (apiToken && options.method && options.method !== "GET") {
+    headers.Authorization = `Bearer ${apiToken}`;
+  }
+
   const res = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
     ...options,
+    headers,
   });
   if (!res.ok) {
     let message = `Request failed (${res.status})`;
     try {
       const body = await res.json();
-      if (body && body.error) message = body.error;
+      if (body?.error?.message) message = body.error.message;
     } catch {
       /* ignore body parse errors */
     }
@@ -20,17 +37,17 @@ async function api(path, options) {
 }
 
 function renderStats(summary) {
-  document.getElementById("stat-income").textContent = fmt(summary.income);
-  document.getElementById("stat-spending").textContent = fmt(-summary.spending);
-  const net = document.getElementById("stat-net");
+  byId("stat-income").textContent = fmt(summary.income);
+  byId("stat-spending").textContent = fmt(-summary.spending);
+  const net = byId("stat-net");
   net.textContent = fmt(summary.net);
-  net.style.color =
-    summary.net >= 0 ? "var(--income)" : "var(--spending)";
+  net.classList.toggle("income", summary.net >= 0);
+  net.classList.toggle("spending", summary.net < 0);
 }
 
 function renderInsights(summary) {
-  const list = document.getElementById("insights");
-  list.innerHTML = "";
+  const list = byId("insights");
+  list.replaceChildren();
   for (const insight of summary.insights) {
     const li = document.createElement("li");
     li.className = `insight ${insight.level}`;
@@ -40,12 +57,12 @@ function renderInsights(summary) {
 }
 
 function renderCategories(summary) {
-  const container = document.getElementById("categories");
-  container.innerHTML = "";
+  const container = byId("categories");
+  container.replaceChildren();
   const spending = summary.categories.filter((c) => c.spent > 0);
 
   if (spending.length === 0) {
-    container.innerHTML = '<p class="hint">No spending recorded yet.</p>';
+    container.appendChild(emptyMessage("No spending recorded yet."));
     return;
   }
 
@@ -70,11 +87,15 @@ function renderCategories(summary) {
     bar.className = "bar";
     const fill = document.createElement("div");
     const pct =
-      c.limit && c.limit > 0
+      c.limit !== null && c.limit > 0
         ? Math.min((c.spent / c.limit) * 100, 100)
         : (c.spent / maxSpent) * 100;
-    fill.className = "bar-fill" + (c.remaining !== null && c.remaining < 0 ? " over" : "");
-    fill.style.width = `${pct}%`;
+    fill.className =
+      "bar-fill" +
+      (c.limit === 0 || (c.remaining !== null && c.remaining < 0)
+        ? " over"
+        : "");
+    fill.style.width = `${Math.max(0, Math.min(pct, 100))}%`;
     bar.appendChild(fill);
 
     wrap.append(head, bar);
@@ -83,10 +104,10 @@ function renderCategories(summary) {
 }
 
 function renderTransactions(transactions) {
-  const list = document.getElementById("transactions");
-  list.innerHTML = "";
+  const list = byId("transactions");
+  list.replaceChildren();
   if (transactions.length === 0) {
-    list.innerHTML = '<p class="hint">No transactions yet.</p>';
+    list.appendChild(emptyMessage("No transactions yet.", "li"));
     return;
   }
   for (const t of transactions) {
@@ -110,34 +131,184 @@ function renderTransactions(transactions) {
   }
 }
 
+function renderTransactionPagination(pagination) {
+  currentTransactionPagination = pagination;
+  const first = pagination.total === 0 ? 0 : pagination.offset + 1;
+  const last = Math.min(
+    pagination.offset + pagination.limit,
+    pagination.total,
+  );
+  byId("transactions-page").textContent =
+    pagination.total === 0
+      ? "Showing 0 transactions"
+      : `Showing ${first}–${last} of ${pagination.total}`;
+  byId("transactions-previous").disabled = pagination.offset === 0;
+  byId("transactions-next").disabled = !pagination.hasMore;
+}
+
+function renderBudgets(budgets) {
+  const list = byId("budgets");
+  list.replaceChildren();
+  if (budgets.length === 0) {
+    list.appendChild(emptyMessage("No budgets configured yet.", "li"));
+    return;
+  }
+
+  for (const budget of budgets) {
+    const item = document.createElement("li");
+    const category = document.createElement("span");
+    category.textContent = budget.category;
+    const limit = document.createElement("strong");
+    limit.textContent = fmt(budget.limit);
+    item.append(category, limit);
+    list.appendChild(item);
+  }
+}
+
+function emptyMessage(message, element = "p") {
+  const node = document.createElement(element);
+  node.className = "hint";
+  node.textContent = message;
+  return node;
+}
+
+function setFormStatus(id, message, kind = "") {
+  const status = byId(id);
+  status.textContent = message;
+  status.className = `form-status ${kind}`.trim();
+}
+
+function errorMessage(error) {
+  return error instanceof Error ? error.message : "An unexpected error occurred";
+}
+
 async function refresh() {
-  const [summary, transactions] = await Promise.all([
+  const [summary, transactionPage, budgets] = await Promise.all([
     api("/api/summary"),
-    api("/api/transactions"),
+    api(
+      `/api/transactions?limit=${TRANSACTION_PAGE_SIZE}&offset=${transactionOffset}`,
+    ),
+    api("/api/budgets"),
   ]);
   renderStats(summary);
   renderInsights(summary);
   renderCategories(summary);
-  renderTransactions(transactions);
+  renderTransactions(transactionPage.data);
+  renderTransactionPagination(transactionPage.pagination);
+  renderBudgets(budgets);
 }
 
-document.getElementById("txn-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const description = document.getElementById("txn-description").value.trim();
-  const amount = Number(document.getElementById("txn-amount").value);
-  if (!description || Number.isNaN(amount) || amount === 0) return;
+async function navigateTransactions(offset) {
+  const previousOffset = transactionOffset;
+  transactionOffset = Math.max(0, offset);
+  byId("transactions-previous").disabled = true;
+  byId("transactions-next").disabled = true;
 
+  try {
+    const transactionPage = await api(
+      `/api/transactions?limit=${TRANSACTION_PAGE_SIZE}&offset=${transactionOffset}`,
+    );
+    renderTransactions(transactionPage.data);
+    renderTransactionPagination(transactionPage.pagination);
+    byId("load-status").textContent = "";
+  } catch (error) {
+    transactionOffset = previousOffset;
+    renderTransactionPagination(currentTransactionPagination);
+    showLoadError(error);
+  }
+}
+
+function showLoadError(error) {
+  const status = byId("load-status");
+  status.textContent = `Could not load the dashboard: ${errorMessage(error)}`;
+  status.classList.add("error");
+}
+
+const tokenInput = byId("api-token");
+tokenInput.value = "";
+tokenInput.addEventListener("input", (event) => {
+  apiToken = event.currentTarget.value;
+});
+
+byId("transactions-previous").addEventListener("click", () => {
+  void navigateTransactions(
+    currentTransactionPagination.offset -
+      currentTransactionPagination.limit,
+  );
+});
+
+byId("transactions-next").addEventListener("click", () => {
+  if (!currentTransactionPagination.hasMore) return;
+  void navigateTransactions(
+    currentTransactionPagination.offset +
+      currentTransactionPagination.limit,
+  );
+});
+
+byId("txn-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector("button");
+  const description = byId("txn-description").value.trim();
+  const amount = Number(byId("txn-amount").value);
+  setFormStatus("txn-status", "");
+  if (!description || !Number.isFinite(amount) || amount === 0) {
+    setFormStatus(
+      "txn-status",
+      "Enter a description and a non-zero finite amount.",
+      "error",
+    );
+    return;
+  }
+
+  button.disabled = true;
   try {
     await api("/api/transactions", {
       method: "POST",
       body: JSON.stringify({ description, amount }),
     });
-    event.target.reset();
-    document.getElementById("txn-description").focus();
+    form.reset();
+    byId("txn-description").focus();
+    setFormStatus("txn-status", "Transaction added.", "success");
+    transactionOffset = 0;
     await refresh();
-  } catch (err) {
-    alert(err.message);
+  } catch (error) {
+    setFormStatus("txn-status", errorMessage(error), "error");
+  } finally {
+    button.disabled = false;
   }
 });
 
-refresh().catch((err) => console.error(err));
+byId("budget-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector("button");
+  const category = byId("budget-category").value;
+  const limit = Number(byId("budget-limit").value);
+  setFormStatus("budget-status", "");
+  if (!Number.isFinite(limit) || limit < 0) {
+    setFormStatus(
+      "budget-status",
+      "Enter a finite, non-negative limit.",
+      "error",
+    );
+    return;
+  }
+
+  button.disabled = true;
+  try {
+    await api("/api/budgets", {
+      method: "POST",
+      body: JSON.stringify({ category, limit }),
+    });
+    byId("budget-limit").value = "";
+    setFormStatus("budget-status", "Budget saved.", "success");
+    await refresh();
+  } catch (error) {
+    setFormStatus("budget-status", errorMessage(error), "error");
+  } finally {
+    button.disabled = false;
+  }
+});
+
+refresh().catch(showLoadError);
