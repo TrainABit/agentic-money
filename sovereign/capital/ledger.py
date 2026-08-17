@@ -13,8 +13,10 @@ ACCOUNTS = (
     "assets.eth",
     "assets.trading_book",
     "assets.receivable",
+    "liability.unearned",
     "income.labor",
     "income.trading",
+    "income.trading_paper",
     "income.products",
     "income.retainers",
     "expenses.infra",
@@ -30,6 +32,8 @@ class Ledger:
     def __init__(self, store: Store) -> None:
         self.store = store
 
+        self._bal_cache: dict[str, float] | None = None
+
     def post(
         self,
         debit: str,
@@ -41,16 +45,20 @@ class Ledger:
     ) -> None:
         if amount < 0:
             raise ValueError("amount must be >= 0")
+        self._bal_cache = None
         self.store.post_ledger(debit, credit, amount, memo, ref, ts=ts)
 
     def balances(self, since: str | None = None) -> dict[str, float]:
+        if since is None and self._bal_cache is not None:
+            return dict(self._bal_cache)
         bal: dict[str, float] = defaultdict(float)
-        for row in self.store.ledger_rows():
-            if since and str(row["ts"]) < since:
-                continue
+        for row in self.store.ledger_rows(since=since):
             bal[row["debit"]] += float(row["amount"])
             bal[row["credit"]] -= float(row["amount"])
-        return dict(bal)
+        out = dict(bal)
+        if since is None:
+            self._bal_cache = dict(out)
+        return out
 
     def balance(self, account: str) -> float:
         return float(self.balances().get(account, 0.0))
@@ -65,11 +73,19 @@ class Ledger:
             + b.get("assets.trading_book", 0)
             + b.get("assets.receivable", 0)
         )
-        return round(assets, 2)
+        liabilities = sum(-v for k, v in b.items() if k.startswith("liability."))
+        return round(assets - liabilities, 2)
 
     def revenue_by_prefix(self, prefix: str = "income.", since: str | None = None) -> float:
         b = self.balances(since=since)
-        return round(sum(-v for k, v in b.items() if k.startswith(prefix)), 2)
+        return round(
+            sum(
+                -v
+                for k, v in b.items()
+                if k.startswith(prefix) and not k.endswith("_paper") and "unearned" not in k
+            ),
+            2,
+        )
 
     def trailing_revenue(self, days: int = 30, now: datetime | None = None) -> float:
         now = now or datetime.now(timezone.utc)

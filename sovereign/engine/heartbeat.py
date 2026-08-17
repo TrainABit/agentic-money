@@ -30,7 +30,6 @@ def step(world: World) -> dict[str, Any]:
     from sovereign.channels.replies import consume as consume_replies
     from sovereign.channels import mail as mailbox
     from sovereign.labor.pipeline import accept_job, reject_job
-    from sovereign.capital.invoice import collect
 
     consume_replies(world)
     for msg in mailbox.ingest_dropins(world):
@@ -42,8 +41,8 @@ def step(world: World) -> dict[str, Any]:
                 accept_job(world, parsed["job_id"], source="mail")
             elif parsed["action"] == "reject":
                 reject_job(world, parsed["job_id"], source="mail")
-            elif parsed["action"] == "paid":
-                collect(world, parsed["job_id"], source="mail")
+            elif parsed["action"] in {"paid", "paid_claim"}:
+                world.store.emit("mail_paid_ignored", {"job_id": parsed["job_id"]}, "courier")
         except KeyError:
             pass
         msg["status"] = "read"

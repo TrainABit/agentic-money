@@ -82,13 +82,22 @@ def interpret(msg: dict[str, Any]) -> dict[str, str] | None:
     job_id = msg.get("job_id") or _extract_job_id(blob)
     if not job_id:
         return None
-    if "accept" in blob or "go ahead" in blob or "you're hired" in blob or "you are hired" in blob:
+    if _has_word(blob, "accepted", "go ahead", "you're hired", "you are hired") or _has_word(blob, "accept"):
         return {"job_id": job_id, "action": "accept"}
-    if "reject" in blob or "pass" in blob or "not a fit" in blob:
+    if _has_word(blob, "rejected", "reject", "not a fit") or _has_word(blob, "pass"):
         return {"job_id": job_id, "action": "reject"}
-    if "paid" in blob or "txid" in blob or "transaction" in blob:
-        return {"job_id": job_id, "action": "paid"}
+    if _has_word(blob, "paid", "txid", "payment received"):
+        return {"job_id": job_id, "action": "paid_claim"}
     return {"job_id": job_id, "action": "note"}
+
+
+def _has_word(blob: str, *words: str) -> bool:
+    import re
+
+    for w in words:
+        if re.search(rf"\b{re.escape(w)}\b", blob):
+            return True
+    return False
 
 
 def _extract_job_id(blob: str) -> str | None:

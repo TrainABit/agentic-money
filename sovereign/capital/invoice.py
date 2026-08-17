@@ -46,10 +46,10 @@ def issue(world: "World", job: dict[str, Any], income_account: str = "income.lab
     job["invoice_id"] = inv["id"]
     job["price_usd"] = amount
     world.store.upsert_job(job)
-    # receivable until collected
+    # billed, not earned
     world.ledger.post(
         "assets.receivable",
-        income_account,
+        "liability.unearned",
         amount,
         f"invoice {inv['id']}",
         ref=inv["id"],
@@ -72,16 +72,23 @@ def collect(
         inv = world.store.invoice_for_job(invoice_or_job)
     if not inv:
         raise KeyError(invoice_or_job)
-    if inv.get("status") == "paid":
+    if inv.get("status") in {"paid", "void"}:
         return inv
     amount = float(inv["amount"])
     account = inv.get("income_account") or "income.labor"
-    # settle receivable into USDC (income already recognized at issue)
     world.ledger.post(
         "assets.usdc",
         "assets.receivable",
         amount,
         f"collect {inv['id']} via {source}",
+        ref=inv["id"],
+        ts=world.stamp(),
+    )
+    world.ledger.post(
+        "liability.unearned",
+        account,
+        amount,
+        f"recognize {inv['id']}",
         ref=inv["id"],
         ts=world.stamp(),
     )
@@ -93,7 +100,34 @@ def collect(
     if job:
         job["status"] = "paid"
         world.store.upsert_job(job)
-        world.store.outcome("collect", amount, True, job.get("title", ""), "treasurer", "labor_studio")
+        play = {
+            "income.labor": "labor_studio",
+            "income.products": "digital_products",
+            "income.retainers": "productized",
+            "income.trading": "tsmom_crypto",
+        }.get(account, "labor_studio")
+        world.store.outcome("collect", amount, True, job.get("title", ""), "treasurer", play)
+    return inv
+
+
+def void(world: "World", invoice_or_job: str, reason: str = "aged") -> dict[str, Any]:
+    inv = world.store.get_invoice(invoice_or_job) or world.store.invoice_for_job(invoice_or_job)
+    if not inv:
+        raise KeyError(invoice_or_job)
+    if inv.get("status") != "open":
+        return inv
+    amount = float(inv["amount"])
+    world.ledger.post(
+        "liability.unearned",
+        "assets.receivable",
+        amount,
+        f"void {inv['id']} {reason}",
+        ref=inv["id"],
+        ts=world.stamp(),
+    )
+    inv["status"] = "void"
+    inv["void_reason"] = reason
+    world.store.upsert_invoice(inv)
     return inv
 
 
@@ -108,5 +142,6 @@ def _markdown(inv: dict[str, Any], firm: str) -> str:
         f"- Ethereum USDC: `{inv['eth_address']}`\n"
         f"- Solana USDC: `{inv['sol_address']}`\n\n"
         f"Send the exact amount with the memo in a note if the rail supports it. "
-        f"The engine watches the ETH USDC balance and marks this paid on receipt.\n"
+        f"The engine watches ETH and Solana USDC and marks this paid on receipt. "
+        f"Email text never settles an invoice.\n"
     )

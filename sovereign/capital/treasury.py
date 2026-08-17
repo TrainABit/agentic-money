@@ -35,7 +35,7 @@ class Treasury:
             return False
         if self.operating_cash() - usd < 0:
             return False
-        # Keep a labor buffer: do not allocate more than 20% of cash until minimum target is hit
+        # Keep a labor buffer: do not allocate more than 10% of cash until minimum target is hit
         snap = self.ledger.snapshot()
         if snap["revenue_usd"] < self.config.goals.minimum_usd:
             cap = self.operating_cash() * 0.10

@@ -53,11 +53,13 @@ def test_live_apply_accept_invoice_pay(tmp_path):
     inv = world.store.invoice_for_job("job_livepipe01")
     assert inv and inv["status"] == "open"
     assert inv["eth_address"].startswith("0x")
+    assert world.ledger.revenue_by_prefix() == 0
     before = world.ledger.balance("assets.usdc")
     collect(world, inv["id"], source="test")
     job = world.store.get_job("job_livepipe01")
     assert job["status"] == "paid"
     assert world.ledger.balance("assets.usdc") == before + 500
+    assert world.ledger.revenue_by_prefix() == 500
     assert (tmp_path / "work" / "job_livepipe01" / "README.md").exists()
 
 
@@ -101,8 +103,15 @@ def test_human_reply_stores_credential_not_in_events(tmp_path):
     assert world.wallet.get_credential("HETZNER_API_TOKEN") == "secret-token-value"
     blob = json.dumps(world.store.events(50))
     assert "secret-token-value" not in blob
+    inbox = (tmp_path / "human_inbox.json").read_text()
+    assert "secret-token-value" not in inbox
+    replies = (tmp_path / "human_replies.json").read_text()
+    assert "secret-token-value" not in replies
 
 
 def test_interpret_mail():
     assert interpret({"subject": "job_abc12345 accepted", "body": "go ahead"})["action"] == "accept"
-    assert interpret({"subject": "paid txid 0x1", "body": "", "job_id": "job_abc12345"})["action"] == "paid"
+    assert interpret({"subject": "paid txid 0x1", "body": "", "job_id": "job_abc12345"})["action"] == "paid_claim"
+    assert interpret({"subject": "job_abc12345 acceptance criteria", "body": "see spec"})["action"] == "note"
+    assert interpret({"subject": "job_abc12345 password reset", "body": ""})["action"] == "note"
+    assert interpret({"subject": "job_abc12345 we'll send the transaction next week", "body": ""})["action"] == "note"
