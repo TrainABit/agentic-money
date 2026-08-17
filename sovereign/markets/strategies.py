@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from sovereign.markets.stats import apply_costs, metrics_from_returns, rolling_mean, rolling_std
+from sovereign.markets.stats import execute, metrics_from_returns, returns_from_close, rolling_mean, rolling_std
 
 
 @dataclass
@@ -105,15 +105,15 @@ class ZScoreMeanReversion(Strategy):
 
 def backtest(strategy: Strategy, close: np.ndarray, cost: float = 0.001) -> dict:
     close = np.asarray(close, dtype=float)
-    ret = np.diff(close, prepend=close[0]) / np.maximum(close, 1e-12)
+    ret = returns_from_close(close)
     pos = strategy.positions(close)
-    net = apply_costs(pos, ret, cost)
-    m = metrics_from_returns(np.nan_to_num(net, nan=0.0))
+    net, held = execute(pos, ret, cost, lag=1)
+    m = metrics_from_returns(np.nan_to_num(net, nan=0.0), position=held)
     return {
         "strategy_id": strategy.id,
         "name": strategy.name,
         "metrics": m.as_dict(),
-        "last_position": float(pos[-1]) if len(pos) else 0.0,
+        "last_position": float(held[-1]) if len(held) else 0.0,
         "equity_end": round(float(np.cumprod(1.0 + np.nan_to_num(net, nan=0.0))[-1]), 4)
         if len(net)
         else 1.0,

@@ -51,7 +51,7 @@ class Registry:
             for name, t in sorted(self._tools.items())
         }
 
-    def call(self, caller: str, name: str, **kwargs: Any) -> ToolResult:
+    def call(self, caller: str, name: str, /, **kwargs: Any) -> ToolResult:
         world = self.world
         if world is None:
             return ToolResult(False, error="registry unbound")

@@ -47,7 +47,38 @@ class Metrics:
         }
 
 
-def metrics_from_returns(rets: np.ndarray, periods_per_year: int = 365) -> Metrics:
+def returns_from_close(close: np.ndarray) -> np.ndarray:
+    close = np.asarray(close, dtype=float)
+    ret = np.zeros_like(close)
+    if len(close) > 1:
+        ret[1:] = np.diff(close) / np.maximum(close[:-1], 1e-12)
+    return ret
+
+
+def execute(position: np.ndarray, ret: np.ndarray, cost: float, lag: int = 1) -> tuple[np.ndarray, np.ndarray]:
+    """Hold the signal from bar t during bar t+lag. Default lag=1 removes same-bar look-ahead."""
+    position = np.asarray(position, dtype=float)
+    ret = np.asarray(ret, dtype=float)
+    held = np.zeros_like(position)
+    if lag <= 0:
+        held = position.copy()
+    elif len(position) > lag:
+        held[lag:] = position[:-lag]
+    turnover = np.abs(np.diff(held, prepend=0.0))
+    net = held * ret - turnover * cost
+    return net, held
+
+
+def apply_costs(position: np.ndarray, ret: np.ndarray, cost: float) -> np.ndarray:
+    net, _ = execute(position, ret, cost, lag=1)
+    return net
+
+
+def metrics_from_returns(
+    rets: np.ndarray,
+    periods_per_year: int = 365,
+    position: np.ndarray | None = None,
+) -> Metrics:
     rets = np.asarray(rets, dtype=float)
     rets = rets[np.isfinite(rets)]
     if len(rets) < 2:
@@ -57,12 +88,11 @@ def metrics_from_returns(rets: np.ndarray, periods_per_year: int = 365) -> Metri
     sd = float(np.std(rets, ddof=1)) or 1e-12
     sharpe = mu / sd * np.sqrt(periods_per_year)
     dd = abs(max_drawdown(equity))
-    trades = int(np.sum(np.abs(np.diff(np.sign(rets), prepend=0)) > 0))
+    if position is not None:
+        p = np.asarray(position, dtype=float)
+        n_trades = int(np.sum(np.abs(np.diff(p, prepend=0.0)) > 1e-12))
+    else:
+        n_trades = 0
     hit = float(np.mean(rets > 0))
     calmar = (float(equity[-1] - 1.0) / dd) if dd > 1e-9 else 0.0
-    return Metrics(float(equity[-1] - 1.0), float(sharpe), float(dd), trades, hit, float(calmar))
-
-
-def apply_costs(position: np.ndarray, ret: np.ndarray, cost: float) -> np.ndarray:
-    turnover = np.abs(np.diff(position, prepend=0.0))
-    return position * ret - turnover * cost
+    return Metrics(float(equity[-1] - 1.0), float(sharpe), float(dd), n_trades, hit, float(calmar))

@@ -7,6 +7,7 @@ import numpy as np
 
 from sovereign.config import RiskLimits
 from sovereign.markets.strategies import STRATEGIES, Strategy, backtest
+from sovereign.markets.stats import execute, metrics_from_returns, returns_from_close
 
 
 def synthetic_ohlc(
@@ -69,7 +70,7 @@ def fetch_closes() -> tuple[np.ndarray, str]:
             errors.append(f"{name}: too short ({len(arr)})")
         except Exception as e:
             errors.append(f"{name}: {e}")
-    return synthetic_ohlc(), "synthetic:" + " | ".join(errors)
+    raise RuntimeError("all market sources failed: " + " | ".join(errors))
 
 
 def walk_forward(
@@ -81,38 +82,29 @@ def walk_forward(
 ) -> dict[str, Any]:
     """Rolling train/test. Certification uses OOS concatenations only."""
     oos_rets = []
+    oos_pos: list[np.ndarray] = []
     windows = 0
     i = 0
     n = len(close)
     while i + train + test <= n:
         sl = close[i : i + train + test]
-        # Positions computed on the window; take only the test segment returns
-        full = backtest(strategy, sl, cost=cost)
-        # Recompute OOS piece
-        ret = np.diff(sl, prepend=sl[0]) / np.maximum(sl, 1e-12)
+        ret = returns_from_close(sl)
         pos = strategy.positions(sl)
-        from sovereign.markets.stats import apply_costs, metrics_from_returns
-
-        net = apply_costs(pos, ret, cost)
-        oos = net[train : train + test]
-        oos_rets.append(np.nan_to_num(oos, nan=0.0))
+        net, held = execute(pos, ret, cost, lag=1)
+        oos_rets.append(np.nan_to_num(net[train : train + test], nan=0.0))
+        oos_pos.append(held[train : train + test])
         windows += 1
         i += test
-        _ = full
     if not oos_rets:
-        # Short series: treat second half as OOS
         split = max(len(close) // 2, 10)
-        ret = np.diff(close, prepend=close[0]) / np.maximum(close, 1e-12)
+        ret = returns_from_close(close)
         pos = strategy.positions(close)
-        from sovereign.markets.stats import apply_costs, metrics_from_returns
-
-        net = apply_costs(pos, ret, cost)
-        m = metrics_from_returns(np.nan_to_num(net[split:], nan=0.0))
+        net, held = execute(pos, ret, cost, lag=1)
+        m = metrics_from_returns(np.nan_to_num(net[split:], nan=0.0), position=held[split:])
         return {"windows": 1, "oos": m.as_dict(), "method": "half_split"}
-    from sovereign.markets.stats import metrics_from_returns
-
     cat = np.concatenate(oos_rets)
-    m = metrics_from_returns(cat)
+    held_cat = np.concatenate(oos_pos)
+    m = metrics_from_returns(cat, position=held_cat)
     return {"windows": windows, "oos": m.as_dict(), "method": "walk_forward"}
 
 

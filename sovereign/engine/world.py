@@ -60,7 +60,7 @@ class World:
         self.freeze_since.pop(agent, None)
         self.store.emit("thaw", {"agent": agent, "reason": reason}, "mechanic")
 
-    def use_tool(self, caller: str, name: str, **kwargs: Any) -> Any:
+    def use_tool(self, caller: str, name: str, /, **kwargs: Any) -> Any:
         if self.tools is None:
             raise RuntimeError("tools unbound")
         return self.tools.call(caller, name, **kwargs)
@@ -98,8 +98,16 @@ class World:
             self.broker.position = float(b.get("position", 0))
             self.broker.last_price = float(b.get("last_price", 0))
             self.broker.frozen = bool(b.get("frozen", False))
+            self.broker.day_start_equity = float(b.get("day_start_equity") or 0)
+            self.broker.week_start_equity = float(b.get("week_start_equity") or 0)
+            self.broker.day_key = str(b.get("day_key") or "")
+            self.broker.week_key = str(b.get("week_key") or "")
+            ht = b.get("halt_tick")
+            self.broker.halt_tick = int(ht) if ht is not None else None
         self.last_prices = dict(meta.get("last_prices") or {})
         self.freeze_since = {k: int(v) for k, v in (meta.get("freeze_since") or {}).items()}
+        if meta.get("provider"):
+            self.router.restore(meta["provider"])
 
     def status(self) -> dict[str, Any]:
         snap = self.ledger.snapshot(now=self.now)
@@ -156,7 +164,7 @@ class World:
         }
 
 
-def bootstrap(config: EngineConfig) -> World:
+def bootstrap(config: EngineConfig, *, heal: bool = True) -> World:
     paths = config.paths()
     paths.ensure()
     seed_playbooks(paths.playbooks)
@@ -231,13 +239,15 @@ def bootstrap(config: EngineConfig) -> World:
         )
     from sovereign.heal.repair import setup as heal_setup
 
-    heal_setup(world, full=False)
-    world.persist_kv()
+    if heal:
+        heal_setup(world, full=False)
+        world.persist_kv()
     return world
 
 
-def load_prices(world: World) -> None:
-    if world.market_close:
+def load_prices(world: World, force: bool = False) -> None:
+    fetched_at = int(world.last_prices.get("tick") or -10**9)
+    if world.market_close and not force and world.tick - fetched_at < world.config.price_refresh_every():
         return
     closes = None
     source = "synthetic"
@@ -247,23 +257,43 @@ def load_prices(world: World) -> None:
             world.store.emit("market_fetch", {"source": source, "n": int(len(closes))}, "trader")
         except Exception as e:
             world.store.emit("market_fetch_failed", {"error": str(e)}, "trader")
+            if world.market_close:
+                return
+            world.last_prices["source"] = "none"
+            world.last_prices["tick"] = world.tick
+            return
     if closes is None:
+        if world.config.mode == "live":
+            world.last_prices["source"] = "none"
+            world.last_prices["tick"] = world.tick
+            return
         closes = synthetic_ohlc()
         source = "synthetic"
     world.market_close = [float(x) for x in closes]
     world.last_prices["BTCUSDT"] = float(closes[-1])
     world.last_prices["source"] = source
+    world.last_prices["tick"] = world.tick
 
 
-def ensure_certified(world: World) -> None:
-    if world.certified:
+def ensure_certified(world: World, force: bool = False) -> None:
+    last = int(world.store.get_kv("certified_tick") or 0)
+    if world.certified and not force and world.tick - last < world.config.recertify_every():
         return
     load_prices(world)
+    source = str(world.last_prices.get("source") or "")
+    if world.config.mode == "live" and (not world.market_close or source in {"none", "synthetic"} or source.startswith("synthetic")):
+        world.store.emit("cert_skipped", {"reason": "no_live_prices", "source": source}, "risk")
+        return
+    if not world.market_close:
+        load_prices(world, force=True)
+        if not world.market_close:
+            return
     import numpy as np
 
     reports = certify(np.array(world.market_close, dtype=float), world.config.risk)
     world.certified = reports
     world.store.set_kv("certified", reports)
+    world.store.set_kv("certified_tick", world.tick)
     artifact = world.config.paths().artifacts / "strategy_certification.json"
     artifact.write_text(json.dumps(reports, indent=2))
     for r in reports:

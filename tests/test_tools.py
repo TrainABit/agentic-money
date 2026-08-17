@@ -30,6 +30,12 @@ def test_tool_allow_and_deny(tmp_path):
     wrote = world.use_tool("improver", "playbook.write_trial", agent="closer", body="# trial\n")
     assert wrote.ok
     assert (tmp_path / "playbooks" / "closer.trial.md").exists()
+    frozen = world.use_tool("risk", "governance.freeze", target="scout", reason="test")
+    assert frozen.ok
+    assert "scout" in world.frozen
+    thawed = world.use_tool("mechanic", "governance.thaw", target="scout", reason="test")
+    assert thawed.ok
+    assert "scout" not in world.frozen
 
 
 def test_cli_tools(tmp_path, capsys):
