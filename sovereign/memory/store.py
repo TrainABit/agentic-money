@@ -209,10 +209,30 @@ class Store:
                   status TEXT NOT NULL,
                   payload TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS messages (
+                  id TEXT PRIMARY KEY,
+                  ts TEXT NOT NULL,
+                  thread_id TEXT NOT NULL,
+                  correlation_id TEXT NOT NULL,
+                  sender TEXT NOT NULL,
+                  recipient TEXT NOT NULL,
+                  kind TEXT NOT NULL,
+                  payload TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  expects_reply INTEGER NOT NULL DEFAULT 0,
+                  reply_to TEXT,
+                  deadline TEXT,
+                  attempts INTEGER NOT NULL DEFAULT 0,
+                  max_attempts INTEGER NOT NULL DEFAULT 3,
+                  error TEXT
+                );
                 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
                 CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status);
                 CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);
                 CREATE INDEX IF NOT EXISTS idx_ledger_ts ON ledger(ts);
+                CREATE INDEX IF NOT EXISTS idx_messages_recipient_status ON messages(recipient, status);
+                CREATE INDEX IF NOT EXISTS idx_messages_correlation ON messages(correlation_id);
+                CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id);
                 """
             )
             self.conn.commit()
@@ -466,6 +486,100 @@ class Store:
         with self._lock:
             rows = self.conn.execute(q, args).fetchall()
         return [json.loads(r["payload"]) for r in rows]
+
+    def insert_message(self, record: dict[str, Any]) -> None:
+        self._execute_write(
+            """
+            INSERT INTO messages(
+              id, ts, thread_id, correlation_id, sender, recipient, kind, payload,
+              status, expects_reply, reply_to, deadline, attempts, max_attempts, error
+            )
+            VALUES(
+              :id, :ts, :thread_id, :correlation_id, :sender, :recipient, :kind, :payload,
+              :status, :expects_reply, :reply_to, :deadline, :attempts, :max_attempts, :error
+            )
+            """,
+            {
+                "id": record["id"],
+                "ts": record["ts"],
+                "thread_id": record["thread_id"],
+                "correlation_id": record["correlation_id"],
+                "sender": record["sender"],
+                "recipient": record["recipient"],
+                "kind": record["kind"],
+                "payload": json.dumps(record.get("payload", {})),
+                "status": record.get("status", "queued"),
+                "expects_reply": 1 if record.get("expects_reply") else 0,
+                "reply_to": record.get("reply_to"),
+                "deadline": record.get("deadline"),
+                "attempts": int(record.get("attempts", 0)),
+                "max_attempts": int(record.get("max_attempts", 3)),
+                "error": record.get("error"),
+            },
+        )
+
+    def update_message(self, record: dict[str, Any]) -> None:
+        """Update a message's mutable, payload-free fields by id."""
+        self._execute_write(
+            "UPDATE messages SET status=:status, attempts=:attempts, error=:error WHERE id=:id",
+            {
+                "id": record["id"],
+                "status": record["status"],
+                "attempts": int(record.get("attempts", 0)),
+                "error": record.get("error"),
+            },
+        )
+
+    def get_message(self, message_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["payload"] = json.loads(item["payload"])
+        return item
+
+    def messages(
+        self,
+        recipient: str | None = None,
+        status: str | None = None,
+        correlation_id: str | None = None,
+        thread_id: str | None = None,
+        limit: int | None = 100,
+    ) -> list[dict[str, Any]]:
+        q = "SELECT * FROM messages WHERE 1=1"
+        args: list[Any] = []
+        if recipient:
+            q += " AND recipient=?"
+            args.append(recipient)
+        if status:
+            q += " AND status=?"
+            args.append(status)
+        if correlation_id:
+            q += " AND correlation_id=?"
+            args.append(correlation_id)
+        if thread_id:
+            q += " AND thread_id=?"
+            args.append(thread_id)
+        q += " ORDER BY ts ASC, id ASC"
+        if limit is not None:
+            q += " LIMIT ?"
+            args.append(int(limit))
+        with self._lock:
+            rows = self.conn.execute(q, args).fetchall()
+        out = []
+        for r in rows:
+            item = dict(r)
+            item["payload"] = json.loads(item["payload"])
+            out.append(item)
+        return out
+
+    def message_counts(self) -> dict[str, int]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT status, COUNT(*) AS n FROM messages GROUP BY status"
+            ).fetchall()
+        return {r["status"]: int(r["n"]) for r in rows}
 
     def upsert_offer(self, offer: dict[str, Any]) -> None:
         record = dict(offer)
