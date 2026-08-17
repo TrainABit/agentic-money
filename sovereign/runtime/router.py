@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import json
 import shutil
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 from sovereign.config import EngineConfig, ModelTier
@@ -91,6 +91,41 @@ class ClaudeCodeProvider:
             raise RuntimeError(proc.stderr.strip() or "claude failed")
         return proc.stdout.strip()
 
+    def complete_in_dir(
+        self,
+        prompt: str,
+        cwd: Path,
+        work_root: Path,
+        tier: ModelTier = "work",
+        timeout: int = 300,
+    ) -> str:
+        resolved = Path(cwd).resolve()
+        root = Path(work_root).resolve()
+        if not str(resolved).startswith(str(root)):
+            raise PermissionError("claude jail escape blocked")
+        if not self.available():
+            raise RuntimeError("claude CLI not on PATH")
+        model = {"fast": "haiku", "work": "sonnet", "think": "opus"}[tier]
+        proc = subprocess.run(
+            [
+                self.bin_name,
+                "-p",
+                prompt,
+                "--output-format",
+                "text",
+                "--model",
+                model,
+                "--dangerously-skip-permissions",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=str(resolved),
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.strip() or "claude failed")
+        return proc.stdout.strip()
+
 
 class Router:
     def __init__(self, config: EngineConfig) -> None:
@@ -137,6 +172,16 @@ class Router:
         text = self.sim.complete(prompt, tier, system)
         self._count("fast", len(text) // 4)
         return text
+
+    def complete_in_dir(self, prompt: str, cwd: Path, work_root: Path, tier: ModelTier = "work") -> str:
+        if self.config.mode == "live" and self.claude.available():
+            try:
+                text = self.claude.complete_in_dir(prompt, cwd, work_root, tier=tier)
+                self._count(tier, max(32, len(prompt) // 4 + 256))
+                return text
+            except Exception:
+                return self.sim.complete(prompt, tier, "jailed crafter")
+        return self.sim.complete(prompt, tier, "jailed crafter")
 
     def _count(self, tier: str, tokens: int) -> None:
         self.usage.tokens += tokens

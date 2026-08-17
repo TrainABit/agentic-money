@@ -50,14 +50,14 @@ class Treasury:
         )
         return True
 
-    def receive(self, usd: float, source: str, income_account: str, ref: str | None = None) -> None:
-        self.ledger.post("assets.usdc", income_account, usd, f"receive {source}", ref)
+    def receive(self, usd: float, source: str, income_account: str, ref: str | None = None, ts: str | None = None) -> None:
+        self.ledger.post("assets.usdc", income_account, usd, f"receive {source}", ref, ts=ts)
 
-    def pay(self, usd: float, expense_account: str, memo: str, ref: str | None = None) -> bool:
+    def pay(self, usd: float, expense_account: str, memo: str, ref: str | None = None, ts: str | None = None) -> bool:
         ok, _ = self.can_spend(usd)
         if not ok:
             return False
-        self.ledger.post(expense_account, "assets.usdc", usd, memo, ref)
+        self.ledger.post(expense_account, "assets.usdc", usd, memo, ref, ts=ts)
         return True
 
     def policy_status(self) -> dict[str, Any]:

@@ -39,13 +39,26 @@ class ModelConfig(BaseModel):
     claude_bin: str = "claude"
 
 
+class SimConfig(BaseModel):
+    """Closed-loop marketplace. Tests use defaults (fast settle)."""
+
+    realism: bool = False
+    autocollect: bool = True
+    auto_accept: bool = True
+    close_rate: float = 1.0
+    pay_delay_ticks: int = 0
+    daily_apply_cap: int = 8
+
+
 class EngineConfig(BaseModel):
     mode: Mode = "sim"
     data_dir: Path = Field(default_factory=lambda: Path("data"))
     tick_seconds: float = 15.0
+    tick_hours: float = 24.0
     goals: Goals = Field(default_factory=Goals)
     risk: RiskLimits = Field(default_factory=RiskLimits)
     models: ModelConfig = Field(default_factory=ModelConfig)
+    sim: SimConfig = Field(default_factory=SimConfig)
     firm_name: str = "Northline Autonomous"
     mandate: str = (
         "Act in the operator's commercial name. Earn, deliver, collect, compound. "
@@ -53,9 +66,27 @@ class EngineConfig(BaseModel):
     )
     public_job_apis: bool = True
     fetch_market_data: bool = True
+    rpc_url: str = "https://ethereum.publicnode.com"
+    usdc_token: str = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+    allow_live_infra_buy: bool = False
+    daily_apply_cap: int = 8
 
     def paths(self) -> "Paths":
         return Paths(self.data_dir)
+
+    def autocollect(self) -> bool:
+        if self.mode == "live":
+            return False
+        if self.sim.realism:
+            return False
+        return self.sim.autocollect
+
+    def auto_accept(self) -> bool:
+        if self.mode == "live":
+            return False
+        if self.sim.realism:
+            return False
+        return self.sim.auto_accept
 
 
 class Paths:
@@ -72,6 +103,12 @@ class Paths:
         self.artifacts = root / "artifacts"
         self.human = root / "human_inbox.json"
         self.human_replies = root / "human_replies.json"
+        self.mail_outbox = root / "mail" / "outbox"
+        self.mail_inbox = root / "mail" / "inbox"
+        self.mail_sent = root / "mail" / "sent"
+        self.invoices = root / "invoices"
+        self.lock = root / "engine.lock"
+        self.config_yaml = root / "config.yaml"
 
     def ensure(self) -> None:
         for p in (
@@ -81,5 +118,9 @@ class Paths:
             self.work,
             self.deliveries,
             self.artifacts,
+            self.mail_outbox,
+            self.mail_inbox,
+            self.mail_sent,
+            self.invoices,
         ):
             p.mkdir(parents=True, exist_ok=True)

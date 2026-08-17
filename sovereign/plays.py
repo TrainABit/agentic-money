@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 
 
@@ -83,7 +84,24 @@ PLAYS: tuple[Play, ...] = (
 )
 
 
-def attention_map(run_rate_usd: float, minimum: float, recommended: float) -> dict[str, float]:
+def play_roi(outcomes: list[dict]) -> dict[str, float]:
+    usd: dict[str, float] = defaultdict(float)
+    for o in outcomes:
+        pid = o.get("play_id")
+        if not pid:
+            continue
+        if o.get("success"):
+            usd[str(pid)] += float(o.get("usd") or 0)
+    return dict(usd)
+
+
+def attention_map(
+    run_rate_usd: float,
+    minimum: float,
+    recommended: float,
+    roi: dict[str, float] | None = None,
+    override: dict[str, float] | None = None,
+) -> dict[str, float]:
     out: dict[str, float] = {}
     for p in PLAYS:
         if run_rate_usd < minimum:
@@ -92,5 +110,16 @@ def attention_map(run_rate_usd: float, minimum: float, recommended: float) -> di
             out[p.id] = p.attention_until_rec
         else:
             out[p.id] = p.attention_after_rec
+    if roi:
+        for k in list(out):
+            earned = float(roi.get(k, 0))
+            if earned > 0:
+                out[k] *= 1.2
+            else:
+                out[k] *= 0.9
+    if override:
+        for k, v in override.items():
+            if k in out and isinstance(v, (int, float)):
+                out[k] = float(v)
     s = sum(out.values()) or 1.0
     return {k: v / s for k, v in out.items()}

@@ -83,6 +83,33 @@ class Store:
               k TEXT PRIMARY KEY,
               v TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS invoices (
+              id TEXT PRIMARY KEY,
+              ts TEXT NOT NULL,
+              job_id TEXT NOT NULL,
+              amount REAL NOT NULL,
+              status TEXT NOT NULL,
+              income_account TEXT NOT NULL,
+              payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS mail (
+              id TEXT PRIMARY KEY,
+              ts TEXT NOT NULL,
+              direction TEXT NOT NULL,
+              address TEXT NOT NULL,
+              subject TEXT NOT NULL,
+              status TEXT NOT NULL,
+              payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS offers (
+              id TEXT PRIMARY KEY,
+              ts TEXT NOT NULL,
+              title TEXT NOT NULL,
+              kind TEXT NOT NULL,
+              price_usd REAL NOT NULL,
+              status TEXT NOT NULL,
+              payload TEXT NOT NULL
+            );
             """
         )
         self.conn.commit()
@@ -113,12 +140,13 @@ class Store:
         amount: float,
         memo: str,
         ref: str | None = None,
+        ts: str | None = None,
     ) -> None:
         if amount == 0:
             return
         self.conn.execute(
             "INSERT INTO ledger(ts, debit, credit, amount, memo, ref) VALUES (?,?,?,?,?,?)",
-            (iso(), debit, credit, float(amount), memo, ref),
+            (ts or iso(), debit, credit, float(amount), memo, ref),
         )
         self.conn.commit()
 
@@ -166,6 +194,118 @@ class Store:
             ).fetchall()
         else:
             rows = self.conn.execute("SELECT payload FROM jobs").fetchall()
+        return [json.loads(r["payload"]) for r in rows]
+
+    def get_job(self, job_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT payload FROM jobs WHERE id=?", (job_id,)).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def job_counts(self) -> dict[str, int]:
+        rows = self.conn.execute("SELECT status, COUNT(*) AS n FROM jobs GROUP BY status").fetchall()
+        return {r["status"]: int(r["n"]) for r in rows}
+
+    def upsert_invoice(self, inv: dict[str, Any]) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO invoices(id, ts, job_id, amount, status, income_account, payload)
+            VALUES(:id, :ts, :job_id, :amount, :status, :income_account, :payload)
+            ON CONFLICT(id) DO UPDATE SET
+              status=excluded.status,
+              payload=excluded.payload
+            """,
+            {
+                "id": inv["id"],
+                "ts": inv.get("ts", iso()),
+                "job_id": inv["job_id"],
+                "amount": float(inv["amount"]),
+                "status": inv["status"],
+                "income_account": inv.get("income_account", "income.labor"),
+                "payload": json.dumps(inv),
+            },
+        )
+        self.conn.commit()
+
+    def invoices(self, status: str | None = None) -> list[dict[str, Any]]:
+        if status:
+            rows = self.conn.execute(
+                "SELECT payload FROM invoices WHERE status=?", (status,)
+            ).fetchall()
+        else:
+            rows = self.conn.execute("SELECT payload FROM invoices ORDER BY ts ASC").fetchall()
+        return [json.loads(r["payload"]) for r in rows]
+
+    def get_invoice(self, invoice_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT payload FROM invoices WHERE id=?", (invoice_id,)).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def invoice_for_job(self, job_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT payload FROM invoices WHERE job_id=? ORDER BY ts DESC LIMIT 1",
+            (job_id,),
+        ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def upsert_mail(self, msg: dict[str, Any]) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO mail(id, ts, direction, address, subject, status, payload)
+            VALUES(:id, :ts, :direction, :address, :subject, :status, :payload)
+            ON CONFLICT(id) DO UPDATE SET
+              status=excluded.status,
+              payload=excluded.payload
+            """,
+            {
+                "id": msg["id"],
+                "ts": msg.get("ts", iso()),
+                "direction": msg.get("direction", "out"),
+                "address": msg.get("address", ""),
+                "subject": msg.get("subject", ""),
+                "status": msg.get("status", "queued"),
+                "payload": json.dumps(msg),
+            },
+        )
+        self.conn.commit()
+
+    def mail(self, direction: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
+        q = "SELECT payload FROM mail WHERE 1=1"
+        args: list[Any] = []
+        if direction:
+            q += " AND direction=?"
+            args.append(direction)
+        if status:
+            q += " AND status=?"
+            args.append(status)
+        q += " ORDER BY ts DESC"
+        return [json.loads(r["payload"]) for r in self.conn.execute(q, args).fetchall()]
+
+    def upsert_offer(self, offer: dict[str, Any]) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO offers(id, ts, title, kind, price_usd, status, payload)
+            VALUES(:id, :ts, :title, :kind, :price_usd, :status, :payload)
+            ON CONFLICT(id) DO UPDATE SET
+              status=excluded.status,
+              payload=excluded.payload
+            """,
+            {
+                "id": offer["id"],
+                "ts": offer.get("ts", iso()),
+                "title": offer["title"],
+                "kind": offer.get("kind", "fixed"),
+                "price_usd": float(offer.get("price_usd", 0)),
+                "status": offer.get("status", "listed"),
+                "payload": json.dumps(offer),
+            },
+        )
+        self.conn.commit()
+
+    def offers(self, status: str | None = None) -> list[dict[str, Any]]:
+        if status:
+            rows = self.conn.execute(
+                "SELECT payload FROM offers WHERE status=?", (status,)
+            ).fetchall()
+        else:
+            rows = self.conn.execute("SELECT payload FROM offers").fetchall()
         return [json.loads(r["payload"]) for r in rows]
 
     def outcome(

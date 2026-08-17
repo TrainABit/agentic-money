@@ -44,11 +44,11 @@ class JobBoard:
         self.sim = sim
         self._sim_catalog = _sim_jobs()
 
-    def search(self, tick: int = 0, live: bool = False) -> list[dict[str, Any]]:
-        jobs = list(self._sim_catalog)
-        # Rotate a couple of fresh sim jobs so Hunter always has flow
-        extra = _tick_jobs(tick)
-        jobs.extend(extra)
+    def search(self, tick: int = 0, live: bool = False, include_sim: bool = True) -> list[dict[str, Any]]:
+        jobs: list[dict[str, Any]] = []
+        if include_sim:
+            jobs.extend(self._sim_catalog)
+            jobs.extend(_tick_jobs(tick))
         if live:
             jobs.extend(self._live())
         # de-dupe
@@ -189,7 +189,12 @@ def deliverable_text(job: dict[str, Any], firm: str) -> str:
     )
 
 
-def sim_client_accepts(job: dict[str, Any], proposal: str) -> bool:
+def sim_client_accepts(job: dict[str, Any], proposal: str, close_rate: float = 1.0) -> bool:
     fit = float(job.get("fit") or 0)
     specific = any(w in proposal.lower() for w in ("scope", "usdc", "48h", "fixed"))
-    return fit >= 0.35 and specific and len(proposal) > 80
+    if not (fit >= 0.35 and specific and len(proposal) > 80):
+        return False
+    if close_rate >= 1.0:
+        return True
+    h = int(hashlib.sha1(str(job.get("id")).encode()).hexdigest()[:8], 16)
+    return (h % 1000) / 1000.0 < close_rate

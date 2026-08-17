@@ -377,15 +377,37 @@ Markets and clients refuse sometimes. The loop keeps going.
 
 ---
 
-## 10. What "done" looks like for this repository
+## 10. Engine loops (what the software actually does)
 
-- A plan with multiple plays and an org chart (this file).
-- A running engine: init → tick → money movement in sim.
-- Proven strategy pipeline: backtest → certify or reject.
-- Mutual control: votes, freezes, reputation.
-- Claude Code provider + mock/sim brain.
-- Read-only dashboard; human inbox for logins only.
-- Tests that exercise a full cycle.
+Every tick, in order:
 
-After that, the constraint is credentials and time on the clock, not
-missing software.
+1. Advance the clock (sim: +`tick_hours`; live: wall clock).
+2. Consume human replies into the encrypted credential vault (values never enter the event log).
+3. Ingest `data/mail/inbox/*.json` and accept/reject/paid jobs from language.
+4. Bookkeeper snapshots **trailing 30-day** revenue vs $2k/$5k/$7k.
+5. Risk + Ethics freeze/slash.
+6. Director funds plays using attention **blended with measured ROI**.
+7. Hunter (sim catalog or live public boards — never mixed).
+8. Closer quotes, writes a proposal, **sends mail** (SMTP if injected, else local outbox).
+9. Crafter produces a **file tree** (script/html/memo) in `data/work/<job>` and, in live with Claude Code, runs `claude -p` jailed to that directory.
+10. Treasurer **issues a USDC invoice** (receivable) instead of silently minting cash. Sim autocollects; live watches the ETH USDC balance or `sovereign paid`.
+11. Trader only if certified + funded + not frozen.
+12. Publisher/Scout list offers and retainers. Operator may buy infra after quorum.
+13. Auditor samples deliveries. Improver patches playbooks and can starve zero-EV plays.
+14. Courier keeps login requests open. Persist sqlite. Sleep. Repeat.
+
+Daemon: `sovereign serve` takes a file lock so two hearts cannot beat.
+
+## 11. What "done enough to run" looks like
+
+- Plan + org + plays (this file).
+- Sim cycle that invoices, mails, crafts files, and collects.
+- Live cycle that can apply → wait → accept → deliver → invoice → collect without autocollect.
+- Strategy gate that can reject.
+- Mutual control + ethics.
+- Claude Code subscription path + jail + sim brain.
+- Human inbox that unblocks credentials.
+- Dashboard with pipeline and invoices.
+- Tests for the above.
+
+Live cash still needs clients and `claude login`. The missing piece is no longer the state machine.

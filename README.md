@@ -27,30 +27,40 @@ pip install -e ".[dev]"
 sovereign init
 sovereign doctor
 sovereign run --ticks 30                 # sim marketplace + paper trading
+sovereign serve --mode live              # daemon, file-locked, crash-safe
 sovereign backtest --live-data           # certify strategies on public BTC
-sovereign dashboard                      # read-only observer
+sovereign dashboard                      # observer: pipeline, invoices, wallets
 ```
 
-Live cognition (after you run `claude login` on the host):
+Live labor loop (no auto-pay):
 
 ```bash
+claude login
 sovereign run --mode live --ticks 1000000
+# inbound accept:
+sovereign accept job_...
+# or drop data/mail/inbox/lead.json with subject "job_... ACCEPTED"
+# after delivery the engine invoices USDC to the firm wallet
+sovereign paid inv_...                   # or it marks paid when USDC arrives
 ```
 
 ## What is running
 
 ```
-Director → funds plays
-Treasurer / Risk / Auditor / Improver → mutual control
-Hunter → Closer → Crafter → collect USDC
+Director → funds plays by trailing-30d ROI
+Treasurer / Risk / Auditor / Ethics / Improver → mutual control
+Hunter → Closer → mail outbox → accept → Crafter (real files, Claude jail) → invoice → USDC
 Trader → certified TSMOM only, walled book, circuit breakers
 Publisher / Scout / Operator / Courier / Bookkeeper
 ```
 
-Wallets (ETH + SOL) are generated at init and encrypted at rest. The mnemonic
-is never logged. Reveal requires `SOVEREIGN_CONFIRM_REVEAL=1`.
+Wallets (ETH + SOL) are generated at init and encrypted at rest. Credentials
+injected via `sovereign reply` land in the same vault and are never written
+to the event log. Mnemonic reveal requires `SOVEREIGN_CONFIRM_REVEAL=1`.
 
-Sim revenue is a closed marketplace used to prove the loop. Live revenue
-requires real clients and a Claude login. The engine will keep working on
-every play that is not blocked by a missing login.
+Sim revenue is a closed marketplace used to prove the loop (invoices still
+exist; they autocollect). Live revenue requires real clients: proposals go
+to `data/mail/`, jobs stay `applied` until mail/`sovereign accept`, invoices
+stay open until chain watch or `sovereign paid`. Other plays keep running
+while a login sits in the inbox.
 """

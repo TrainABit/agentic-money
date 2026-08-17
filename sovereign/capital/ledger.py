@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sovereign.memory.store import Store
+from sovereign.memory.store import Store, iso
 
 ACCOUNTS = (
     "assets.cash_usd",
@@ -36,14 +37,17 @@ class Ledger:
         amount: float,
         memo: str,
         ref: str | None = None,
+        ts: str | None = None,
     ) -> None:
         if amount < 0:
             raise ValueError("amount must be >= 0")
-        self.store.post_ledger(debit, credit, amount, memo, ref)
+        self.store.post_ledger(debit, credit, amount, memo, ref, ts=ts)
 
-    def balances(self) -> dict[str, float]:
+    def balances(self, since: str | None = None) -> dict[str, float]:
         bal: dict[str, float] = defaultdict(float)
         for row in self.store.ledger_rows():
+            if since and str(row["ts"]) < since:
+                continue
             bal[row["debit"]] += float(row["amount"])
             bal[row["credit"]] -= float(row["amount"])
         return dict(bal)
@@ -63,21 +67,27 @@ class Ledger:
         )
         return round(assets, 2)
 
-    def revenue_by_prefix(self, prefix: str = "income.") -> float:
-        """Income is credit-normal; signed balance is negative for net revenue."""
-        b = self.balances()
+    def revenue_by_prefix(self, prefix: str = "income.", since: str | None = None) -> float:
+        b = self.balances(since=since)
         return round(sum(-v for k, v in b.items() if k.startswith(prefix)), 2)
+
+    def trailing_revenue(self, days: int = 30, now: datetime | None = None) -> float:
+        now = now or datetime.now(timezone.utc)
+        since = iso(now - timedelta(days=days))
+        return self.revenue_by_prefix(since=since)
 
     def expenses(self) -> float:
         b = self.balances()
         return round(sum(v for k, v in b.items() if k.startswith("expenses.")), 2)
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self, now: datetime | None = None) -> dict[str, Any]:
         b = self.balances()
+        trailing = self.trailing_revenue(30, now=now)
         return {
             "balances": b,
             "equity_usd": self.equity_usd(),
             "revenue_usd": self.revenue_by_prefix(),
+            "trailing_30d_usd": trailing,
             "labor_usd": round(-b.get("income.labor", 0), 2),
             "trading_usd": round(-b.get("income.trading", 0), 2),
             "products_usd": round(-b.get("income.products", 0), 2),

@@ -62,11 +62,40 @@ class Wallet:
             self.bundle = WalletBundle(**raw["wallet"])
             return self.bundle
         self.bundle = generate_bundle()
-        payload = {"wallet": asdict(self.bundle)}
+        self._write({"wallet": asdict(self.bundle), "credentials": {}})
+        return self.bundle
+
+    def _read(self) -> dict:
+        f = _fernet(self.master_key_path)
+        if not self.secrets_path.exists():
+            self.load_or_create()
+        return json.loads(f.decrypt(self.secrets_path.read_bytes()).decode())
+
+    def _write(self, payload: dict) -> None:
+        f = _fernet(self.master_key_path)
         blob = f.encrypt(json.dumps(payload).encode())
         self.secrets_path.write_bytes(blob)
         os.chmod(self.secrets_path, 0o600)
-        return self.bundle
+
+    def put_credential(self, key: str, value: str) -> None:
+        raw = self._read()
+        creds = dict(raw.get("credentials") or {})
+        creds[key] = value
+        raw["credentials"] = creds
+        if "wallet" not in raw and self.bundle:
+            raw["wallet"] = asdict(self.bundle)
+        self._write(raw)
+
+    def get_credential(self, key: str) -> str | None:
+        raw = self._read()
+        creds = raw.get("credentials") or {}
+        val = creds.get(key)
+        return str(val) if val else None
+
+    def credential_flags(self) -> dict[str, bool]:
+        raw = self._read()
+        creds = raw.get("credentials") or {}
+        return {k: bool(v) for k, v in creds.items()}
 
     def public(self) -> dict[str, str]:
         if not self.bundle:

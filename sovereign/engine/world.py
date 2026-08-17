@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from sovereign.capital.ledger import Ledger
@@ -33,17 +34,24 @@ class World:
     human: HumanInbox
     broker: PaperBroker
     tick: int = 0
+    now: datetime = field(default_factory=utcnow)
     frozen: set[str] = field(default_factory=set)
     certified: list[dict[str, Any]] = field(default_factory=list)
     identity: dict[str, str] = field(default_factory=dict)
     market_close: list[float] = field(default_factory=list)
     last_prices: dict[str, float] = field(default_factory=dict)
 
+    def stamp(self) -> str:
+        if self.config.mode == "live":
+            return iso()
+        return iso(self.now)
+
     def persist_kv(self) -> None:
         self.store.set_kv(
             "meta",
             {
                 "tick": self.tick,
+                "now": iso(self.now),
                 "frozen": sorted(self.frozen),
                 "certified": self.certified,
                 "identity": self.identity,
@@ -57,6 +65,8 @@ class World:
     def load_kv(self) -> None:
         meta = self.store.get_kv("meta") or {}
         self.tick = int(meta.get("tick", 0))
+        if meta.get("now"):
+            self.now = datetime.fromisoformat(meta["now"])
         self.frozen = set(meta.get("frozen") or [])
         self.certified = list(meta.get("certified") or [])
         self.identity = dict(meta.get("identity") or {})
@@ -71,23 +81,32 @@ class World:
         self.last_prices = dict(meta.get("last_prices") or {})
 
     def status(self) -> dict[str, Any]:
-        snap = self.ledger.snapshot()
+        snap = self.ledger.snapshot(now=self.now)
         goals = self.config.goals
-        rev = snap["revenue_usd"]
+        rev = snap["trailing_30d_usd"]
+        counts = self.store.job_counts()
         return {
             "firm": self.config.firm_name,
             "mode": self.config.mode,
             "tick": self.tick,
-            "ts": iso(),
+            "ts": self.stamp(),
             "identity": self.identity,
             "wallet": self.wallet.public(),
+            "credentials_present": self.wallet.credential_flags(),
             "ledger": snap,
             "treasury": self.treasury.policy_status(),
+            "pipeline": counts,
+            "invoices_open": len(self.store.invoices("open")),
+            "invoices_paid": len(self.store.invoices("paid")),
+            "offers": self.store.offers(),
+            "mail_out": len(self.store.mail(direction="out")),
+            "mail_in": len(self.store.mail(direction="in")),
             "goals": {
                 "minimum": goals.minimum_usd,
                 "recommended": goals.recommended_usd,
                 "good": goals.good_usd,
                 "run_rate_usd": rev,
+                "lifetime_usd": snap["revenue_usd"],
                 "progress_min": round(min(1.0, rev / goals.minimum_usd), 4),
                 "progress_rec": round(min(1.0, rev / goals.recommended_usd), 4),
                 "progress_good": round(min(1.0, rev / goals.good_usd), 4),
@@ -97,8 +116,8 @@ class World:
             "broker": self.broker.snapshot(),
             "frozen_agents": sorted(self.frozen),
             "reputation": self.reputation.scores,
-            "open_jobs": len(self.store.jobs("open")),
-            "active_jobs": len(self.store.jobs("accepted")) + len(self.store.jobs("in_progress")),
+            "open_jobs": counts.get("open", 0),
+            "active_jobs": counts.get("accepted", 0) + counts.get("in_progress", 0),
             "human_inbox": self.human.open(),
             "cognition": self.router.snapshot(),
             "recent_events": self.store.events(25),
@@ -152,14 +171,28 @@ def bootstrap(config: EngineConfig) -> World:
             },
             agent="director",
         )
-        # Genesis float in sim so the loop can pay tiny infra and show compounding
         if config.mode == "sim":
-            ledger.post("assets.usdc", "equity.treasury", 250.0, "sim genesis float")
+            ledger.post("assets.usdc", "equity.treasury", 250.0, "sim genesis float", ts=world.stamp())
         world.human.ask(
             service="claude",
             instruction="Install Claude Code if needed, then run `claude login` on the host using the Claude Pro/Max subscription (not an API key). Reply with {\"ok\": \"1\"}.",
             fields=["ok"],
             why="Live cognition uses the subscription CLI. Sim brain already runs.",
+        )
+        world.human.ask(
+            service="bank_kyc",
+            instruction="When you can, open Stripe or a business account (Mercury/Wise). Drop field notes here. Until then USDC is the treasury. A KYC packet is in artifacts/kyc_packet.md.",
+            fields=["STRIPE_SECRET", "note"],
+            why="Fiat off-ramp. Not required to earn in USDC.",
+        )
+        packet = paths.artifacts / "kyc_packet.md"
+        packet.write_text(
+            f"# KYC packet — {config.firm_name}\n\n"
+            f"- Activity: remote software, research, automation services; systematic crypto on a walled book.\n"
+            f"- ETH: {bundle_pub.eth_address}\n"
+            f"- SOL: {bundle_pub.sol_address}\n"
+            f"- Expected volume: ${config.goals.minimum_usd:.0f}–${config.goals.good_usd:.0f}/mo.\n"
+            f"- Operators: autonomous agents under the human legal person.\n"
         )
     world.persist_kv()
     return world
@@ -182,8 +215,6 @@ def load_prices(world: World) -> None:
     world.market_close = [float(x) for x in closes]
     world.last_prices["BTCUSDT"] = float(closes[-1])
     world.last_prices["source"] = source
-    world.market_close = [float(x) for x in closes]
-    world.last_prices["BTCUSDT"] = float(closes[-1])
 
 
 def ensure_certified(world: World) -> None:
