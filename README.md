@@ -26,10 +26,12 @@ Read the full plan: [`docs/PLAN.md`](docs/PLAN.md) · plays: [`docs/PLAYS.md`](d
 
 ```bash
 pip install -e ".[dev]"
+sovereign bootstrap                      # one-shot: init + full repair + readiness verdict
 sovereign init
 sovereign setup                          # repair paths, playbooks, inbox, lock, tools
 sovereign doctor --fix                   # same heal + CLI/wallet checks
 sovereign tools --agent mechanic         # permissioned tool bus
+sovereign agents --agent closer          # roster: mission, tier, tools, prompt, inbox
 sovereign run --ticks 30                 # sim marketplace + paper trading
 sovereign serve --mode live              # daemon, file-locked, crash-heals
 sovereign backtest --live-data           # certify strategies on public BTC
@@ -97,6 +99,16 @@ Every agent calls a **permissioned tool bus** (`jobs.*`, `mail.*`, `invoice.*`,
 `heal.*`, `playbook.*`, `governance.freeze/thaw`, `brain.complete`). A hunter
 cannot freeze anyone. A closer cannot run `heal.repair`. Denials are audited;
 tool kwargs (secrets) are not logged.
+
+### Runtime and agent communication
+
+The sixteen agents run inside one supervised engine process against one
+SQLite world — not separate VMs. Tool grants derive from each agent's spec
+(drift fails at startup), and agents talk over a persistent message bus
+(multicast, request/reply with deadlines, at-least-once retries, dead-letter
+audit). `sovereign agents` prints the live roster; the full topology, roster
+table, message protocol, quorum walkthrough, and scaling path are in
+[`docs/RUNTIME.md`](docs/RUNTIME.md).
 
 The firm runs without you. Ordinary work has no approval queue. If sqlite
 paths, playbooks, the human inbox, a stale lock, or the tool registry break,
