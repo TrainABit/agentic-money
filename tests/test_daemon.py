@@ -11,7 +11,7 @@ def test_file_lock_exclusive(tmp_path):
         b.acquire()
         raise AssertionError("second lock should fail")
     except RuntimeError:
-        pass
+        assert p.read_text()  # A failed contender must not truncate holder metadata.
     finally:
         a.release()
     c = FileLock(p)

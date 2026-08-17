@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import json
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -70,6 +70,11 @@ def jail_contains(child: Path, root: Path) -> bool:
 
 
 class ClaudeCodeProvider:
+    MAX_OUTPUT_BYTES = 1024 * 1024
+    ALL_TOOLS = ("Read", "Write", "Edit", "Glob", "Grep", "Bash", "Agent", "WebFetch", "WebSearch")
+    CRAFT_TOOLS = ("Read", "Write", "Edit", "Glob", "Grep")
+    CRAFT_DENIED_TOOLS = ("Bash", "Agent", "WebFetch", "WebSearch")
+
     def __init__(self, bin_name: str = "claude", models: dict[str, str] | None = None) -> None:
         self.bin_name = bin_name
         self.models = models or {"fast": "haiku", "work": "sonnet", "think": "opus"}
@@ -83,27 +88,58 @@ class ClaudeCodeProvider:
     def _model(self, tier: ModelTier) -> str:
         return self.models.get(tier, {"fast": "haiku", "work": "sonnet", "think": "opus"}[tier])
 
+    def _bounded_output(self, handle: Any, fallback: Any = None) -> str:
+        handle.seek(0)
+        raw = handle.read(self.MAX_OUTPUT_BYTES + 1)
+        if not raw and fallback:
+            raw = fallback.encode() if isinstance(fallback, str) else bytes(fallback)
+            raw = raw[: self.MAX_OUTPUT_BYTES + 1]
+        truncated = len(raw) > self.MAX_OUTPUT_BYTES
+        raw = raw[: self.MAX_OUTPUT_BYTES]
+        text = raw.decode("utf-8", errors="replace")
+        return text + ("\n[output truncated]" if truncated else "")
+
+    def _invoke(self, argv: list[str], *, cwd: Path, timeout: int) -> str:
+        with tempfile.TemporaryFile(mode="w+b") as stdout, tempfile.TemporaryFile(mode="w+b") as stderr:
+            try:
+                proc = subprocess.run(
+                    argv,
+                    stdout=stdout,
+                    stderr=stderr,
+                    stdin=subprocess.DEVNULL,
+                    timeout=timeout,
+                    cwd=str(cwd),
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError("claude timed out") from exc
+            output = self._bounded_output(stdout, getattr(proc, "stdout", None))
+            error = self._bounded_output(stderr, getattr(proc, "stderr", None))
+        if proc.returncode != 0:
+            raise RuntimeError(error.strip() or "claude failed")
+        return output.strip()
+
     def complete(self, prompt: str, tier: ModelTier, system: str) -> str:
         if not self.available():
             raise RuntimeError("claude CLI not on PATH")
         full = f"{system.strip()}\n\n{prompt}"
-        proc = subprocess.run(
-            [
-                self.bin_name,
-                "-p",
-                full,
-                "--output-format",
-                "text",
-                "--model",
-                self._model(tier),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(proc.stderr.strip() or "claude failed")
-        return proc.stdout.strip()
+        argv = [
+            self.bin_name,
+            "-p",
+            full,
+            "--output-format",
+            "text",
+            "--model",
+            self._model(tier),
+            "--permission-mode",
+            "dontAsk",
+            "--allowedTools",
+            "",
+            "--disallowedTools",
+            ",".join(self.ALL_TOOLS),
+        ]
+        with tempfile.TemporaryDirectory(prefix="sovereign-claude-") as directory:
+            return self._invoke(argv, cwd=Path(directory), timeout=180)
 
     def complete_in_dir(
         self,
@@ -119,42 +155,22 @@ class ClaudeCodeProvider:
             raise PermissionError("claude jail escape blocked")
         if not self.available():
             raise RuntimeError("claude CLI not on PATH")
-        settings_dir = resolved / ".claude"
-        settings_dir.mkdir(exist_ok=True)
-        (settings_dir / "settings.json").write_text(
-            json.dumps(
-                {
-                    "permissions": {
-                        "allow": ["Read", "Write", "Edit", "Glob", "Grep"],
-                        "deny": ["Bash", "Agent", "WebFetch", "WebSearch"],
-                    }
-                }
-            )
-        )
-        proc = subprocess.run(
-            [
-                self.bin_name,
-                "-p",
-                prompt,
-                "--output-format",
-                "text",
-                "--model",
-                self._model(tier),
-                "--permission-mode",
-                "dontAsk",
-                "--allowedTools",
-                "Read,Write,Edit,Glob,Grep",
-                "--disallowedTools",
-                "Bash,Agent,WebFetch,WebSearch",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=str(resolved),
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(proc.stderr.strip() or "claude failed")
-        return proc.stdout.strip()
+        argv = [
+            self.bin_name,
+            "-p",
+            prompt,
+            "--output-format",
+            "text",
+            "--model",
+            self._model(tier),
+            "--permission-mode",
+            "dontAsk",
+            "--allowedTools",
+            ",".join(self.CRAFT_TOOLS),
+            "--disallowedTools",
+            "Bash,Agent,WebFetch,WebSearch",
+        ]
+        return self._invoke(argv, cwd=resolved, timeout=timeout)
 
 
 class Router:
@@ -169,6 +185,7 @@ class Router:
         self.usage_day = ""
         self.degraded = False
         self.queued = 0
+        self.last_error: str | None = None
 
     def provider_name(self) -> str:
         if self.degraded:
@@ -177,14 +194,15 @@ class Router:
             return self.sim.name()
         if self.config.models.provider == "claude_code" and self.claude.available():
             return self.claude.name()
-        return self.sim.name()
+        return "unavailable"
 
     def _roll_day(self) -> None:
-        day = datetime.now(timezone.utc).date().isoformat()
+        day = datetime.now(UTC).date().isoformat()
         if self.usage_day != day:
             self.usage = Usage()
             self.usage_day = day
             self.degraded = False
+            self.last_error = None
 
     def remaining_budget(self) -> int:
         self._roll_day()
@@ -197,41 +215,72 @@ class Router:
         system: str = "You are a Sovereign firm agent. Be specific. No fluff.",
     ) -> str:
         est = max(32, (len(system) + len(prompt)) // 4 + 256)
+        self._roll_day()
         if tier == "think" and self.usage.tokens > 0.7 * self.config.models.daily_token_budget:
             tier = "work"
         if est > self.remaining_budget():
-            self.degraded = True
-            self.queued += 1
             if self.config.mode == "live":
-                return ""
+                return self._queue("daily model budget exhausted")
             text = self.sim.complete(prompt, "fast", system)
             self._count("fast", len(text) // 4)
             return text
-        if self.config.mode == "live" and self.claude.available():
-            try:
-                text = self.claude.complete(prompt, tier, system)
-                self._count(tier, est + len(text) // 4)
-                return text
-            except Exception:
-                self.degraded = True
-                self.queued += 1
-                if not self.config.models.allow_api_fallback:
-                    return ""
-                raise
-        text = self.sim.complete(prompt, tier, system)
-        self._count("fast", len(text) // 4)
+        if self.config.mode != "live":
+            text = self.sim.complete(prompt, tier, system)
+            self._count("fast", len(text) // 4)
+            return text
+        if self.degraded:
+            return self._queue(self.last_error or "model provider unavailable")
+        if self.config.models.provider != "claude_code":
+            return self._queue(f"model provider {self.config.models.provider!r} is unavailable")
+        if not self.claude.available():
+            reason = "claude CLI unavailable"
+            if self.config.models.allow_api_fallback:
+                reason += "; API fallback is not configured"
+            return self._queue(reason)
+        try:
+            text = self.claude.complete(prompt, tier, system)
+        except Exception:  # noqa: BLE001 - live inference must fail closed
+            reason = "claude invocation failed"
+            if self.config.models.allow_api_fallback:
+                reason += "; API fallback is not configured"
+            return self._queue(reason)
+        self._count(tier, est + len(text) // 4)
         return text
 
     def complete_in_dir(self, prompt: str, cwd: Path, work_root: Path, tier: ModelTier = "work") -> str:
-        if self.config.mode == "live" and self.claude.available() and not self.degraded:
-            try:
-                text = self.claude.complete_in_dir(prompt, cwd, work_root, tier=tier)
-                self._count(tier, max(32, len(prompt) // 4 + 256))
-                return text
-            except Exception:
-                self.degraded = True
-                return self.sim.complete(prompt, tier, "jailed crafter")
-        return self.sim.complete(prompt, tier, "jailed crafter")
+        if not jail_contains(Path(cwd), Path(work_root)):
+            raise PermissionError("claude jail escape blocked")
+        estimate = max(32, len(prompt) // 4 + 256)
+        if self.config.mode != "live":
+            text = self.sim.complete(prompt, tier, "jailed crafter")
+            self._count("fast", len(text) // 4)
+            return text
+        if estimate > self.remaining_budget():
+            return self._queue("daily model budget exhausted")
+        if self.degraded:
+            return self._queue(self.last_error or "model provider unavailable")
+        if self.config.models.provider != "claude_code":
+            return self._queue(f"model provider {self.config.models.provider!r} is unavailable")
+        if not self.claude.available():
+            reason = "claude CLI unavailable"
+            if self.config.models.allow_api_fallback:
+                reason += "; API fallback is not configured"
+            return self._queue(reason)
+        try:
+            text = self.claude.complete_in_dir(prompt, cwd, work_root, tier=tier)
+        except Exception:  # noqa: BLE001 - live inference must fail closed
+            reason = "claude invocation failed"
+            if self.config.models.allow_api_fallback:
+                reason += "; API fallback is not configured"
+            return self._queue(reason)
+        self._count(tier, estimate + len(text) // 4)
+        return text
+
+    def _queue(self, reason: str) -> str:
+        self.degraded = True
+        self.queued += 1
+        self.last_error = reason
+        return ""
 
     def _count(self, tier: str, tokens: int) -> None:
         self._roll_day()
@@ -252,12 +301,14 @@ class Router:
             "usage_day": self.usage_day,
             "degraded": self.degraded,
             "queued": self.queued,
+            "last_error": self.last_error,
         }
 
     def restore(self, snap: dict[str, Any]) -> None:
         self.usage_day = str(snap.get("usage_day") or "")
         self.degraded = bool(snap.get("degraded"))
         self.queued = int(snap.get("queued") or 0)
+        self.last_error = str(snap.get("last_error")) if snap.get("last_error") else None
         self.usage.tokens = int(snap.get("tokens") or 0)
         self.usage.calls = int(snap.get("calls") or 0)
         if snap.get("by_tier"):

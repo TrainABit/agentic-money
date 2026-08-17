@@ -20,11 +20,18 @@ class FileLock:
 
     def acquire(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.fd = open(self.path, "w")
+        # Opening with "w" truncates the live holder's PID before flock reports
+        # contention. Keep the inode and metadata intact until this descriptor
+        # actually owns the lock.
+        self.fd = open(self.path, "a+")
         try:
             fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as e:
+            self.fd.close()
+            self.fd = None
             raise RuntimeError(f"engine already running ({self.path})") from e
+        self.fd.seek(0)
+        self.fd.truncate()
         self.fd.write(str(os.getpid()))
         self.fd.flush()
 

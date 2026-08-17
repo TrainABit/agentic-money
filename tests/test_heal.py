@@ -1,8 +1,8 @@
 import json
-import os
 
 from sovereign.agents.roles import improver, mechanic
 from sovereign.config import EngineConfig
+from sovereign.engine.daemon import FileLock
 from sovereign.engine.heartbeat import step
 from sovereign.engine.world import bootstrap
 from sovereign.heal.repair import setup, thaw_cooled
@@ -93,12 +93,16 @@ def test_ab_promote_and_revert(tmp_path):
     assert revert_trial(pb, "closer") is False
 
 
-def test_stale_lock_pid_alive_is_not_removed(tmp_path):
+def test_actively_held_lock_is_not_removed(tmp_path):
     cfg = EngineConfig(mode="sim", data_dir=tmp_path)  # type: ignore[arg-type]
     world = bootstrap(cfg)
     paths = cfg.paths()
-    paths.lock.write_text(str(os.getpid()))
-    report = setup(world, full=False)
-    by_code = {f["code"]: f for f in report["findings"]}
-    assert by_code["lock"]["ok"]
-    assert paths.lock.exists()
+    lock = FileLock(paths.lock)
+    lock.acquire()
+    try:
+        report = setup(world, full=False)
+        by_code = {f["code"]: f for f in report["findings"]}
+        assert by_code["lock"]["ok"]
+        assert paths.lock.exists()
+    finally:
+        lock.release()

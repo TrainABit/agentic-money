@@ -27,9 +27,19 @@ def test_quote_and_calldata():
     assert decode_uint256("0x1e240") == 123456
 
 
-def test_live_apply_accept_invoice_pay(tmp_path):
+def test_live_apply_accept_invoice_pay(tmp_path, monkeypatch):
     cfg = _live(tmp_path)
     world = bootstrap(cfg)
+    monkeypatch.setattr(
+        world.router,
+        "complete",
+        lambda *_args, **_kwargs: "Scoped proposal from the configured live provider.",
+    )
+    monkeypatch.setattr(
+        world.router,
+        "complete_in_dir",
+        lambda *_args, **_kwargs: "delivery complete",
+    )
     world.store.upsert_job(
         {
             "id": "job_livepipe01",
@@ -110,7 +120,16 @@ def test_human_reply_stores_credential_not_in_events(tmp_path):
 
 
 def test_interpret_mail():
-    assert interpret({"subject": "job_abc12345 accepted", "body": "go ahead"})["action"] == "accept"
+    assert (
+        interpret(
+            {
+                "subject": "job_abc12345 accepted",
+                "body": "go ahead",
+                "state_change_authorized": True,
+            }
+        )["action"]
+        == "accept"
+    )
     assert interpret({"subject": "paid txid 0x1", "body": "", "job_id": "job_abc12345"})["action"] == "paid_claim"
     assert interpret({"subject": "job_abc12345 acceptance criteria", "body": "see spec"})["action"] == "note"
     assert interpret({"subject": "job_abc12345 password reset", "body": ""})["action"] == "note"

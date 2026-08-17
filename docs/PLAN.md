@@ -102,12 +102,14 @@ Hard rules:
 2. Never send transcripts. Send a **state snapshot** (balances, missions,
    last 20 events, relevant playbook).
 3. Cache a stable system preamble (role + policy). Only the snapshot changes.
-4. Daily token budget (`model_budget_daily_tokens`). Surplus work queues.
+4. Daily token budget (`models.daily_token_budget`). Surplus work queues.
 5. Draft with Haiku, upgrade to Sonnet only if the Closer/Auditor score is
    below threshold.
 6. One Sonnet delivery session per job, in a jailed work directory.
-7. If subscription rate-limits, degrade to templates + queue. Do not fall
-   through to paid API unless `allow_api_fallback: true`.
+7. If subscription rate-limits or Claude is unavailable, fail closed and
+   queue. Live work never uses simulation templates. `allow_api_fallback`
+   is reserved for a future configured API provider and currently remains
+   fail-closed.
 
 Expected load to hold $5k/mo labor (order of magnitude):
 
@@ -178,9 +180,10 @@ cannot freeze; a closer cannot heal. Denials emit `tool_denied`. Tool
 arguments are never written to the event log (credentials stay in the vault).
 
 `sovereign setup` and `sovereign doctor --fix` run the same repair path the
-Mechanic runs every tick: recreate missing paths, migrate sqlite, reseed
-playbooks, reset a corrupt human inbox, drop a stale lock, rebind tools,
-recertify strategies, sync the paper broker. The daemon (`sovereign serve`)
+Mechanic invokes on a bounded cadence: recreate missing paths, migrate sqlite,
+reseed playbooks, reset a corrupt human inbox, repair an unlocked stale lock,
+rebind tools, recertify strategies, and sync the paper broker. Lightweight
+checks still run during heartbeats. The daemon (`sovereign serve`)
 runs a full heal on start and after a crashed tick, then continues. Other
 plays keep running while a login sits in the inbox.
 
@@ -198,8 +201,9 @@ research briefs, landing copy, data cleaning, bot setups, code review,
 technical writing.
 
 **Why it hits $2k:** Four closed jobs at $500, or two at $1,000, in 30 days.
-Agents work every tick. Platforms are a channel, not the identity: public
-boards (RemoteOK, Arbeitnow, HN threads, direct outbound) plus email.
+Agents evaluate work every tick. Platforms are a channel, not the identity:
+public boards provide leads, but scraped contacts are never mailed until a
+channel is explicitly verified.
 
 **Unit economics:**
 
@@ -301,7 +305,7 @@ when measured $/hour changes.
 
 **$2,000 (weeks, not myths):**
 
-- Hunter pulls public jobs every tick.
+- Hunter uses a bounded, cached public-board poll.
 - Closer sends a small number of *specific* proposals (not spray).
 - Crafter ships same day / next day.
 - Bookkeeper recognizes cash on receipt (USDC or marked paid).

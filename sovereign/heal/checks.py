@@ -64,6 +64,21 @@ def diagnose(world: "World") -> list[Finding]:
         pub = world.wallet.public()
         ok = pub["eth_address"].startswith("0x") and bool(pub["sol_address"])
         out.append(Finding("wallet", ok, pub["eth_address"] if ok else "missing", repairable=not ok, repair="wallet"))
+        from sovereign.capital.wallet import derive_solana_keypair
+
+        bundle = world.wallet.bundle
+        mnemonic_sol = derive_solana_keypair(bundle.mnemonic)[0] if bundle else ""
+        backup_ok = bool(bundle) and mnemonic_sol == pub["sol_address"]
+        out.append(
+            Finding(
+                "wallet_backup",
+                backup_ok,
+                "mnemonic restores ETH and SOL"
+                if backup_ok
+                else "legacy SOL key requires secrets.enc backup",
+                repairable=False,
+            )
+        )
     except Exception as e:
         out.append(Finding("wallet", False, str(e)[:200], repairable=True, repair="wallet"))
 
@@ -119,8 +134,24 @@ def diagnose(world: "World") -> list[Finding]:
         repair="bind_tools",
     ))
 
-    rec = world.store.get_kv("usdc_onchain")
-    _ = rec
+    payment = world.store.get_kv("payment_watch_v2") or {}
+    suspense = float(world.store.get_kv("usdc_suspense", 0.0) or 0.0)
+    reserved = float(world.store.get_kv("usdc_manual_reserved", 0.0) or 0.0)
+    payment_ok = not payment or (
+        payment.get("version") == 2 and suspense < 0.000001 and reserved < 0.000001
+    )
+    out.append(
+        Finding(
+            "payment_reconciliation",
+            payment_ok,
+            (
+                "ok"
+                if payment_ok
+                else f"suspense={suspense:.6f} reserved={reserved:.6f}"
+            ),
+            repairable=False,
+        )
+    )
     book = world.treasury.trading_book()
     drift = world.broker.cash == 0 and book > 0
     out.append(Finding(
@@ -149,17 +180,21 @@ def diagnose(world: "World") -> list[Finding]:
 def _stale_lock(path: Path) -> int | None:
     if not path.exists():
         return None
+    # The kernel lock is authoritative. PID text can be stale, truncated, or
+    # refer to a reused process, so only repair an inode that is not locked.
+    import fcntl
+
     try:
-        pid = int(path.read_text().strip() or "0")
-    except Exception:
-        return 0
-    if pid <= 0:
-        return 0
-    try:
-        import os
-        os.kill(pid, 0)
-        return None  # process lives
+        with path.open("a+") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return None
+            try:
+                handle.seek(0)
+                raw = handle.read().strip()
+                return int(raw) if raw.isdigit() and int(raw) > 0 else -1
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
     except OSError:
-        return pid
-    except Exception:
-        return pid
+        return None

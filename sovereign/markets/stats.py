@@ -16,8 +16,11 @@ def rolling_mean(x: np.ndarray, n: int) -> np.ndarray:
 
 def rolling_std(x: np.ndarray, n: int) -> np.ndarray:
     out = np.full_like(x, np.nan, dtype=float)
-    for i in range(n - 1, len(x)):
-        out[i] = np.std(x[i - n + 1 : i + 1], ddof=1)
+    if n <= 0 or len(x) < n:
+        return out
+    windows = np.lib.stride_tricks.sliding_window_view(np.asarray(x, dtype=float), n)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out[n - 1 :] = np.std(windows, axis=-1, ddof=1)
     return out
 
 
@@ -33,7 +36,7 @@ class Metrics:
     sharpe: float
     max_drawdown: float
     n_trades: int
-    hit_rate: float
+    positive_bar_rate: float
     calmar: float
 
     def as_dict(self) -> dict[str, float | int]:
@@ -42,7 +45,7 @@ class Metrics:
             "sharpe": round(self.sharpe, 4),
             "max_drawdown": round(self.max_drawdown, 4),
             "n_trades": int(self.n_trades),
-            "hit_rate": round(self.hit_rate, 4),
+            "positive_bar_rate": round(self.positive_bar_rate, 4),
             "calmar": round(self.calmar, 4),
         }
 
@@ -55,22 +58,50 @@ def returns_from_close(close: np.ndarray) -> np.ndarray:
     return ret
 
 
-def execute(position: np.ndarray, ret: np.ndarray, cost: float, lag: int = 1) -> tuple[np.ndarray, np.ndarray]:
-    """Hold the signal from bar t during bar t+lag. Default lag=1 removes same-bar look-ahead."""
+def execute(
+    position: np.ndarray,
+    ret: np.ndarray,
+    round_trip_cost: float = 0.0,
+    lag: int = 1,
+    *,
+    cost: float | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Execute lagged positions and charge a full round-trip cost per unit cycle.
+
+    A unit entry or exit is one side of a round trip and is charged half of
+    ``round_trip_cost``. A direct long-to-short flip has two units of turnover
+    and therefore incurs one full round-trip cost. ``cost`` is retained as a
+    backwards-compatible keyword alias.
+    """
+    if cost is not None:
+        round_trip_cost = cost
+    if not np.isfinite(round_trip_cost) or round_trip_cost < 0:
+        raise ValueError("round_trip_cost must be finite and non-negative")
     position = np.asarray(position, dtype=float)
     ret = np.asarray(ret, dtype=float)
+    if position.shape != ret.shape:
+        raise ValueError("position and return arrays must have the same shape")
     held = np.zeros_like(position)
     if lag <= 0:
         held = position.copy()
     elif len(position) > lag:
         held[lag:] = position[:-lag]
     turnover = np.abs(np.diff(held, prepend=0.0))
-    net = held * ret - turnover * cost
+    net = held * ret - turnover * (round_trip_cost / 2.0)
     return net, held
 
 
-def apply_costs(position: np.ndarray, ret: np.ndarray, cost: float) -> np.ndarray:
-    net, _ = execute(position, ret, cost, lag=1)
+def apply_costs(
+    position: np.ndarray,
+    ret: np.ndarray,
+    round_trip_cost: float = 0.0,
+    *,
+    cost: float | None = None,
+) -> np.ndarray:
+    """Apply lag and round-trip transaction-cost semantics to a return series."""
+    if cost is not None:
+        round_trip_cost = cost
+    net, _ = execute(position, ret, round_trip_cost, lag=1)
     return net
 
 
@@ -79,6 +110,14 @@ def metrics_from_returns(
     periods_per_year: int = 365,
     position: np.ndarray | None = None,
 ) -> Metrics:
+    """Summarize bar returns and economic position-state transitions.
+
+    ``n_trades`` counts entries, exits, and direction changes. Changes in
+    position magnitude while remaining long or short (for example volatility
+    target rebalancing) are not additional trades. ``positive_bar_rate`` is
+    the fraction of evaluated bars with a strictly positive net return; it is
+    not a round-trip trade win rate.
+    """
     rets = np.asarray(rets, dtype=float)
     rets = rets[np.isfinite(rets)]
     if len(rets) < 2:
@@ -90,9 +129,19 @@ def metrics_from_returns(
     dd = abs(max_drawdown(equity))
     if position is not None:
         p = np.asarray(position, dtype=float)
-        n_trades = int(np.sum(np.abs(np.diff(p, prepend=0.0)) > 1e-12))
+        economic_state = np.zeros_like(p, dtype=np.int8)
+        economic_state[p > 1e-12] = 1
+        economic_state[p < -1e-12] = -1
+        n_trades = int(np.count_nonzero(np.diff(economic_state, prepend=0)))
     else:
         n_trades = 0
-    hit = float(np.mean(rets > 0))
+    positive_bar_rate = float(np.mean(rets > 0))
     calmar = (float(equity[-1] - 1.0) / dd) if dd > 1e-9 else 0.0
-    return Metrics(float(equity[-1] - 1.0), float(sharpe), float(dd), n_trades, hit, float(calmar))
+    return Metrics(
+        float(equity[-1] - 1.0),
+        float(sharpe),
+        float(dd),
+        n_trades,
+        positive_bar_rate,
+        float(calmar),
+    )

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 from sovereign.config import Paths
+from sovereign.fileio import atomic_write_text, file_lock
 from sovereign.memory.store import iso
+
+T = TypeVar("T")
 
 
 class HumanInbox:
@@ -14,14 +17,37 @@ class HumanInbox:
     def __init__(self, paths: Paths) -> None:
         self.paths = paths
         self.paths.ensure()
+        self.lock_path = self.paths.human.with_name(self.paths.human.name + ".lock")
+        with file_lock(self.lock_path):
+            if not self.paths.human.exists():
+                self._write_unlocked([])
+
+    def _read_unlocked(self) -> list[dict[str, Any]]:
         if not self.paths.human.exists():
-            self._write([])
+            return []
+        raw = json.loads(self.paths.human.read_text())
+        if not isinstance(raw, list):
+            raise TypeError("human inbox must contain a list")
+        return raw
 
     def _read(self) -> list[dict[str, Any]]:
-        return json.loads(self.paths.human.read_text())
+        with file_lock(self.lock_path, shared=True):
+            return self._read_unlocked()
+
+    def _write_unlocked(self, items: list[dict[str, Any]]) -> None:
+        atomic_write_text(self.paths.human, json.dumps(items, indent=2), mode=0o600)
 
     def _write(self, items: list[dict[str, Any]]) -> None:
-        self.paths.human.write_text(json.dumps(items, indent=2))
+        with file_lock(self.lock_path):
+            self._write_unlocked(items)
+
+    def update(self, fn: Callable[[list[dict[str, Any]]], T]) -> T:
+        """Apply one read-modify-write operation while holding the inbox lock."""
+        with file_lock(self.lock_path):
+            items = self._read_unlocked()
+            result = fn(items)
+            self._write_unlocked(items)
+            return result
 
     def ask(
         self,
@@ -30,44 +56,48 @@ class HumanInbox:
         fields: list[str],
         why: str,
     ) -> dict[str, Any]:
-        items = self._read()
-        for it in items:
-            if it.get("service") == service and it.get("status") == "open":
-                return it
-        item = {
-            "id": f"hr_{len(items)+1:04d}",
-            "ts": iso(),
-            "kind": "login",
-            "service": service,
-            "instruction": instruction,
-            "fields": fields,
-            "why": why,
-            "status": "open",
-            "reply": {},
-        }
-        items.append(item)
-        self._write(items)
-        return item
+        def add(items: list[dict[str, Any]]) -> dict[str, Any]:
+            for existing in items:
+                if existing.get("service") == service and existing.get("status") == "open":
+                    return existing
+            item = {
+                "id": f"hr_{len(items)+1:04d}",
+                "ts": iso(),
+                "kind": "login",
+                "service": service,
+                "instruction": instruction,
+                "fields": fields,
+                "why": why,
+                "status": "open",
+                "reply": {},
+            }
+            items.append(item)
+            return item
+
+        return self.update(add)
 
     def reply(self, request_id: str, fields: dict[str, str]) -> dict[str, Any]:
-        items = self._read()
-        for it in items:
-            if it["id"] == request_id:
-                it["reply"] = fields
-                it["status"] = "filled"
-                it["filled_ts"] = iso()
-                self._write(items)
+        with file_lock(self.lock_path):
+            items = self._read_unlocked()
+            for item in items:
+                if item["id"] != request_id:
+                    continue
+                item["reply"] = dict(fields)
+                item["status"] = "filled"
+                item["filled_ts"] = iso()
+                self._write_unlocked(items)
                 replies = []
                 if self.paths.human_replies.exists():
                     try:
-                        replies = json.loads(self.paths.human_replies.read_text())
-                    except Exception:
+                        loaded = json.loads(self.paths.human_replies.read_text())
+                        replies = loaded if isinstance(loaded, list) else []
+                    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                         replies = []
-                log = dict(it)
+                log = dict(item)
                 log["reply"] = {k: "[set]" for k in fields}
                 replies.append(log)
-                self.paths.human_replies.write_text(json.dumps(replies, indent=2))
-                return it
+                atomic_write_text(self.paths.human_replies, json.dumps(replies, indent=2), mode=0o600)
+                return item
         raise KeyError(request_id)
 
     def open(self) -> list[dict[str, Any]]:

@@ -4,7 +4,13 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from sovereign.markets.stats import execute, metrics_from_returns, returns_from_close, rolling_mean, rolling_std
+from sovereign.markets.stats import (
+    execute,
+    metrics_from_returns,
+    returns_from_close,
+    rolling_mean,
+    rolling_std,
+)
 
 
 @dataclass
@@ -103,11 +109,24 @@ class ZScoreMeanReversion(Strategy):
         return pos
 
 
-def backtest(strategy: Strategy, close: np.ndarray, cost: float = 0.001) -> dict:
+def backtest(
+    strategy: Strategy,
+    close: np.ndarray,
+    round_trip_cost: float = 0.001,
+    *,
+    cost: float | None = None,
+) -> dict:
+    """Backtest a strategy with a total entry-plus-exit transaction cost.
+
+    ``cost`` remains available as a backwards-compatible keyword alias for
+    callers that predate the explicit ``round_trip_cost`` name.
+    """
+    if cost is not None:
+        round_trip_cost = cost
     close = np.asarray(close, dtype=float)
     ret = returns_from_close(close)
     pos = strategy.positions(close)
-    net, held = execute(pos, ret, cost, lag=1)
+    net, held = execute(pos, ret, round_trip_cost, lag=1)
     m = metrics_from_returns(np.nan_to_num(net, nan=0.0), position=held)
     return {
         "strategy_id": strategy.id,
