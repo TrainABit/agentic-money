@@ -7,6 +7,8 @@ import sys
 import time
 from pathlib import Path
 
+import yaml
+
 from sovereign.config import EngineConfig
 from sovereign.engine.heartbeat import step
 from sovereign.engine.world import bootstrap, load_prices
@@ -14,7 +16,17 @@ from sovereign.markets.data import certify, fetch_closes
 
 
 def _config(args: argparse.Namespace) -> EngineConfig:
-    cfg = EngineConfig(mode=args.mode, data_dir=Path(args.data_dir))  # type: ignore[arg-type]
+    data_dir = Path(args.data_dir)
+    config_path = data_dir / "config.yaml"
+    values: dict[str, object] = {}
+    if config_path.exists():
+        loaded = yaml.safe_load(config_path.read_text())
+        if loaded is not None and not isinstance(loaded, dict):
+            raise ValueError(f"{config_path} must contain a YAML mapping")
+        values.update(loaded or {})
+    # Explicit CLI globals always win over persisted configuration.
+    values.update({"mode": args.mode, "data_dir": data_dir})
+    cfg = EngineConfig.model_validate(values)
     if getattr(args, "realistic", False):
         cfg.sim.realism = True
         cfg.sim.close_rate = 0.55
@@ -216,7 +228,19 @@ def cmd_accept(args: argparse.Namespace) -> int:
 def cmd_paid(args: argparse.Namespace) -> int:
     from sovereign.capital.invoice import collect
 
-    world = bootstrap(_config(args))
+    cfg = _config(args)
+    if cfg.mode == "live" and not args.confirm:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "live manual settlement requires --confirm after verifying payment",
+                },
+                indent=2,
+            )
+        )
+        return 1
+    world = bootstrap(cfg)
     inv = collect(world, args.ref, source="cli")
     world.persist_kv()
     print(json.dumps({"ok": True, "invoice": inv["id"], "amount": inv["amount"], "status": inv["status"]}, indent=2))
@@ -313,6 +337,11 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("paid", help="Mark an invoice or job paid")
     _globals(s)
     s.add_argument("ref", help="invoice id or job id")
+    s.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Live mode: confirm that payment was independently verified",
+    )
     s.set_defaults(func=cmd_paid)
 
     s = sub.add_parser("invoices", help="List invoices")
@@ -328,7 +357,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except (KeyError, PermissionError, RuntimeError, ValueError) as exc:
+        print(
+            json.dumps({"ok": False, "error": str(exc) or type(exc).__name__}),
+            file=sys.stderr,
+        )
+        return 1
 
 
 if __name__ == "__main__":
