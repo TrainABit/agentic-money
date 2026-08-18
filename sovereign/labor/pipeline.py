@@ -16,6 +16,34 @@ TERMINAL_OR_PROTECTED = frozenset(
 )
 
 
+def won_lost_lesson(job: dict[str, Any], won: bool) -> tuple[str, str]:
+    """Topic and compact content (<=200 chars) for a closer win/loss lesson.
+
+    Shared by the pipeline's direct write and the closer's tool write so both
+    produce identical strings and the knowledge base dedupes them to one note.
+    """
+    price = float(job.get("price_usd") or 0)
+    content = f"{job.get('title', '')} | ${price:.0f} | fit={job.get('fit')}"
+    return ("won_job" if won else "lost_job", content[:200])
+
+
+def _record_closer_lesson(world: World, job: dict[str, Any], won: bool) -> None:
+    """Best-effort direct knowledge write for a closed job.
+
+    accept_job/reject_job are reached from mail and CLI contexts that carry no
+    tool caller identity, so this bypasses the tool registry on purpose. It
+    must never affect the job transition, hence the blanket except.
+    """
+    knowledge = getattr(world, "knowledge", None)
+    if knowledge is None:
+        return
+    try:
+        topic, content = won_lost_lesson(job, won)
+        knowledge.remember("closer", topic, content, now=world.now)
+    except Exception:  # noqa: BLE001 - memory is optional, transitions are not
+        return
+
+
 def accept_job(world: World, job_id: str, source: str = "manual") -> dict[str, Any]:
     job_id = validate_job_id(job_id)
     job = world.store.get_job(job_id)
@@ -41,6 +69,7 @@ def accept_job(world: World, job_id: str, source: str = "manual") -> dict[str, A
     from sovereign.memory.skills import record
 
     record(world, "closer.accept", True, float(job.get("price_usd") or 0))
+    _record_closer_lesson(world, job, won=True)
     return job
 
 
@@ -58,4 +87,5 @@ def reject_job(world: World, job_id: str, source: str = "manual") -> dict[str, A
     job["rejected_via"] = source
     world.store.upsert_job(job)
     world.store.outcome("proposal", 0, False, job.get("title", ""), "closer", "labor_studio")
+    _record_closer_lesson(world, job, won=False)
     return job

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import csv
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from sovereign.agents.spec import spec_for, system_prompt_for, tool_matrix
 from sovereign.capital import invoice as invoices
+from sovereign.capital.invariants import verify_invariants
 from sovereign.channels import mail as mailbox
 from sovereign.labor.craft import produce
 from sovereign.labor.pipeline import accept_job
@@ -12,6 +14,9 @@ from sovereign.markets.data import certify
 from sovereign.memory.playbooks import DEFAULT_PLAYBOOKS
 from sovereign.security import job_child, safe_child, validate_job_id
 from sovereign.tools.base import Registry, Tool
+
+NOTIFY_CAP_PER_TICK = 5
+NOTIFY_GUARD_KEY = "comms_notify_guard"
 
 # (name, description, fn, wants_caller). Allowlists are NOT declared here:
 # they are derived from AGENT_SPECS so prompts and enforcement cannot drift.
@@ -89,6 +94,18 @@ def _tool_defs() -> list[ToolDef]:
            lambda w: w.store.offers()),
         _t("files.list_work", "List jailed work files",
            lambda w, job_id: _list_work(w, job_id)),
+        _t("knowledge.remember", "Store a lesson in the caller's knowledge memory",
+           _knowledge_remember, wants_caller=True),
+        _t("knowledge.recall", "Recall lessons from the caller's (plus shared) knowledge memory",
+           _knowledge_recall, wants_caller=True),
+        _t("knowledge.share", "Publish a lesson into the shared firm knowledge namespace",
+           _knowledge_share, wants_caller=True),
+        _t("ledger.verify_invariants", "Cross-check ledger balances against invoices and the broker",
+           lambda w: verify_invariants(w)),
+        _t("ledger.export", "Export every ledger row to a timestamped CSV artifact",
+           _ledger_export),
+        _t("comms.notify", "Send a rate-capped notify to named agents over the bus",
+           _comms_notify, wants_caller=True),
     ]
 
 
@@ -179,3 +196,75 @@ def _list_work(w, job_id: str) -> list[str]:
     if not p.exists():
         return []
     return sorted(x.name for x in p.iterdir() if x.is_file() and not x.is_symlink())
+
+
+def _knowledge_base(w):
+    kb = getattr(w, "knowledge", None)
+    if kb is None:
+        raise RuntimeError("knowledge base unavailable")
+    return kb
+
+
+def _knowledge_remember(w, caller: str, topic: str, content: str, source: str = "self", confidence: float = 0.6):
+    # The authenticated caller is the only writable namespace; there is no
+    # way to pass another agent's name through this tool.
+    return _knowledge_base(w).remember(
+        caller, topic, content, now=w.now, source=source, confidence=confidence
+    )
+
+
+def _knowledge_recall(w, caller: str, query: str, limit: int = 5):
+    limit = max(1, min(10, int(limit)))
+    return _knowledge_base(w).recall(caller, query, now=w.now, limit=limit)
+
+
+def _knowledge_share(w, caller: str, topic: str, content: str, confidence: float = 0.6):
+    # Shared namespace writes are attributed to the caller via `source`.
+    return _knowledge_base(w).remember(
+        "firm", topic, content, now=w.now, source=caller, confidence=confidence
+    )
+
+
+def _ledger_export(w) -> dict[str, Any]:
+    exports = w.config.paths().artifacts / "exports"
+    exports.mkdir(parents=True, exist_ok=True)
+    stamp = w.now.strftime("%Y%m%dT%H%M%SZ")
+    path = exports / f"ledger_{stamp}.csv"
+    rows = w.store.ledger_rows()
+    with path.open("w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["ts", "debit", "credit", "amount", "memo", "ref"])
+        for row in rows:
+            writer.writerow(
+                [row["ts"], row["debit"], row["credit"], row["amount"], row["memo"], row["ref"]]
+            )
+    return {"path": str(path), "rows": len(rows)}
+
+
+def _comms_notify(w, caller: str, recipients, payload) -> dict[str, Any]:
+    if w.comms is None:
+        raise RuntimeError("comms bus unavailable")
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be a dict")
+    if isinstance(recipients, str):
+        targets = [recipients]
+    elif isinstance(recipients, (list, tuple)):
+        targets = list(recipients)
+    else:
+        raise ValueError("recipients must be a string or a list of strings")
+    if not targets or not all(isinstance(r, str) and r for r in targets):
+        raise ValueError("recipients must be a string or a list of strings")
+    # One shared per-tick budget across ALL callers; only successful sends
+    # consume it, and the bus itself validates recipients against the roster.
+    guard = w.store.get_kv(NOTIFY_GUARD_KEY) or {}
+    count = int(guard.get("count", 0)) if guard.get("tick") == w.tick else 0
+    if count >= NOTIFY_CAP_PER_TICK:
+        raise ValueError("notify rate cap reached")
+    receipt = w.comms.send(caller, targets, "notify", payload, now=w.now)
+    w.store.set_kv(NOTIFY_GUARD_KEY, {"tick": w.tick, "count": count + 1})
+    return {
+        "thread_id": receipt.thread_id,
+        "correlation_id": receipt.correlation_id,
+        "message_ids": list(receipt.message_ids),
+        "recipients": targets,
+    }
