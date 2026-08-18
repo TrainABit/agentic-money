@@ -328,11 +328,14 @@ def _web_navigate(w, caller: str, url: str) -> dict[str, Any]:
         WebPolicyError,
     )
 
+    from sovereign.web.session import redact_url
+
     web = _web_runtime(w)
     if not web.policy().allows(url):
         # Checked before open() so a denied URL never starts a browser and
-        # never consumes tick budget.
-        return {"blocked": "policy", "detail": f"navigation denied by policy: {url}"}
+        # never consumes tick budget. Redact any userinfo so a credentials-in-URL
+        # password never lands in the tool result.
+        return {"blocked": "policy", "detail": f"navigation denied by policy: {redact_url(url)}"}
     _web_charge(w)
     try:
         session = web.open(_web_host(url), on_secret=_web_secret_resolver(w))

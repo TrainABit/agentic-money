@@ -61,6 +61,13 @@ class World:
         return iso(aware_utc(self.now))
 
     def start_tick(self) -> None:
+        # A browser left open by a previous crashed tick must never survive into
+        # the next one; finish_tick closes it on the happy path, this covers crashes.
+        if getattr(self, "web", None) is not None:
+            try:
+                self.web.close()
+            except Exception:
+                pass
         marker = self.store.get_kv("tick_start") or {}
         try:
             marked_tick = int(marker.get("tick", 0))
