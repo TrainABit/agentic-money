@@ -29,6 +29,9 @@ dev = [
 mail = [
   "agentmail>=0.5.6",
 ]
+mcp = [
+  "mcp>=1.9.0",
+]
 web = [
   "playwright>=1.62.0",
 ]

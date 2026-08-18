@@ -76,6 +76,33 @@ class WebConfig(BaseModel):
     actions_per_tick: int = 40
 
 
+class McpServerConfig(BaseModel):
+    """One external Model Context Protocol server the engine may bridge to.
+
+    Fail-closed: an agent can only reach a server that names it in
+    allow_agents, and env_credentials maps a child ENV VAR name to a vault
+    credential ref that is resolved only at connect time (never stored here).
+    """
+
+    name: str
+    transport: Literal["stdio", "http"] = "stdio"
+    command: str | None = None
+    args: tuple[str, ...] = ()
+    url: str | None = None
+    env_credentials: dict[str, str] = Field(default_factory=dict)
+    allow_agents: tuple[str, ...] = ()
+    allowed_tools: tuple[str, ...] = ()  # empty = all discovered tools
+    timeout_s: float = 30.0
+    calls_per_tick: int = 10
+
+
+class McpConfig(BaseModel):
+    """MCP client bridge. Fail-closed: disabled and no servers by default."""
+
+    enabled: bool = False
+    servers: tuple[McpServerConfig, ...] = ()
+
+
 class LiveTiming(BaseModel):
     """Wall-clock lifecycle limits and bounded live cadences."""
 
@@ -108,6 +135,7 @@ class EngineConfig(BaseModel):
     tick_hours: float = 24.0
     debug: DebugConfig = Field(default_factory=DebugConfig)
     web: WebConfig = Field(default_factory=WebConfig)
+    mcp: McpConfig = Field(default_factory=McpConfig)
     goals: Goals = Field(default_factory=Goals)
     risk: RiskLimits = Field(default_factory=RiskLimits)
     models: ModelConfig = Field(default_factory=ModelConfig)
