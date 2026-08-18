@@ -20,7 +20,7 @@ are documented in [`docs/MODELS.md`](docs/MODELS.md).
 Labor cashflow is the path to $2k. Retainers/products are the path to $5–7k.
 Trading compounds a treasury; it does not pay rent from a tiny bankroll.
 
-Read the full plan: [`docs/PLAN.md`](docs/PLAN.md) · plays: [`docs/PLAYS.md`](docs/PLAYS.md) · bootstrap: [`docs/BOOTSTRAP.md`](docs/BOOTSTRAP.md) · architecture: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) · runbook: [`docs/RUNBOOK.md`](docs/RUNBOOK.md) · deploy: [`docs/DEPLOY.md`](docs/DEPLOY.md)
+Read the full plan: [`docs/PLAN.md`](docs/PLAN.md) · plays: [`docs/PLAYS.md`](docs/PLAYS.md) · bootstrap: [`docs/BOOTSTRAP.md`](docs/BOOTSTRAP.md) · architecture: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) · runbook: [`docs/RUNBOOK.md`](docs/RUNBOOK.md) · deploy: [`docs/DEPLOY.md`](docs/DEPLOY.md) · trading: [`docs/TRADING.md`](docs/TRADING.md)
 
 ## Quick start
 
@@ -34,6 +34,9 @@ sovereign tools --agent mechanic         # permissioned tool bus
 sovereign agents --agent closer          # roster: mission, tier, tools, prompt, inbox
 sovereign run --ticks 30                 # sim marketplace + paper trading
 sovereign serve --mode live              # daemon; refuses unready live starts (--force overrides)
+sovereign serve --workers                # same loop, eligible agents in spawned processes
+sovereign trading                        # Hyperliquid/paper venue status (never keys)
+sovereign worker --agent bookkeeper --once
 sovereign backtest --live-data           # certify strategies on public BTC
 sovereign dashboard                      # observer: pipeline, invoices, wallets, health, metrics
 sovereign comms --status dead            # inspect bus messages; --requeue / --purge-days

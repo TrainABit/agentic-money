@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 import traceback
 import uuid
+from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any, Callable
 
@@ -12,6 +13,21 @@ from sovereign.plays import PLAYS, attention_map, play_roi
 
 
 AgentFn = Callable[[World], list[dict[str, Any]]]
+
+
+@dataclass
+class AgentTick:
+    """Outcome of one named role inside a heartbeat tick."""
+
+    name: str
+    actions: list[dict[str, Any]] = field(default_factory=list)
+    errors: int = 0
+    ms: float = 0.0
+    comms_ms: float = 0.0
+    comms_processed: int = 0
+    timeout: bool = False
+    error: str | None = None
+    skipped_frozen: bool = False
 
 TICK_METRICS_KEY = "tick_metrics"
 TICK_METRICS_KEEP = 50
@@ -73,6 +89,96 @@ def _record_tick_metrics(
         entry["agents_ms"] = agents_ms
     ring.append(entry)
     world.store.set_kv(TICK_METRICS_KEY, ring[-TICK_METRICS_KEEP:])
+
+
+def _pump_inbox(world: World, agent: str, timeout_s: float) -> tuple[float, int]:
+    """Timeout-guarded inbox pump. Returns (comms_ms, processed_count)."""
+    from sovereign.comms.handlers import process_inbox
+
+    started = time.monotonic()
+    try:
+        summaries = run_with_timeout(
+            lambda: process_inbox(world, agent), seconds=timeout_s, agent=agent
+        )
+    except AgentTimeout:
+        world.store.emit("comms_timeout", {"agent": agent}, agent)
+        return (time.monotonic() - started) * 1000.0, 0
+    comms_ms = (time.monotonic() - started) * 1000.0
+    if summaries:
+        world.store.emit("comms", {"count": len(summaries), "results": summaries}, agent)
+    return comms_ms, len(summaries)
+
+
+def run_one_agent(
+    world: World,
+    name: str,
+    *,
+    queued: dict[str, int] | None = None,
+    timeout_s: float | None = None,
+    tracing: bool = False,
+) -> AgentTick:
+    """Run one named role with watchdog, reputation, and event emission.
+
+    Workers call this without ``start_tick`` / ``finish_tick``.
+    """
+    from sovereign.agents import roles
+
+    timeout_s = float(timeout_s if timeout_s is not None else world.config.agent_timeout_seconds)
+    queued = queued if queued is not None else {}
+    fn = getattr(roles, name, None)
+    if fn is None:
+        return AgentTick(name=name, errors=1, error=f"unknown agent {name}")
+    if name in world.frozen:
+        world.store.emit("skipped_frozen", {"agent": name}, name)
+        return AgentTick(name=name, skipped_frozen=True)
+    result = AgentTick(name=name)
+    if world.comms is not None and queued.get(name, 0) > 0:
+        result.comms_ms, result.comms_processed = _pump_inbox(world, name, timeout_s)
+    trace = getattr(world, "debug_trace", None)
+    agent_started = time.monotonic()
+    try:
+        produced = run_with_timeout(
+            lambda fn=fn: fn(world), seconds=timeout_s, agent=name
+        ) or []
+    except AgentTimeout:
+        budget_ms = timeout_s * 1000.0
+        result.ms = budget_ms
+        result.errors = 1
+        result.timeout = True
+        result.error = f"timeout after {timeout_s:g}s"
+        world.store.emit("agent_timeout", {"agent": name, "seconds": timeout_s}, name)
+        if tracing and trace is not None:
+            trace.record_agent(name, budget_ms, 0, error=result.error)
+        world.reputation.slash(name, 3, result.error)
+        if world.reputation.should_freeze(name):
+            world.freeze(name, result.error, kind="runtime")
+        return result
+    except Exception as e:
+        role_ms = (time.monotonic() - agent_started) * 1000.0
+        result.ms = role_ms
+        result.errors = 1
+        result.error = str(e)
+        world.store.emit("agent_error", {"error": str(e)}, name)
+        if tracing and trace is not None:
+            trace.record_agent(
+                name,
+                role_ms,
+                0,
+                error=str(e),
+                traceback_tail=traceback.format_exc()[-800:],
+            )
+        world.reputation.slash(name, 5, f"exception: {e}")
+        if world.reputation.should_freeze(name):
+            world.freeze(name, f"exception: {e}", kind="runtime")
+        return result
+    role_ms = (time.monotonic() - agent_started) * 1000.0
+    result.ms = role_ms
+    result.actions = list(produced)
+    if tracing and trace is not None:
+        trace.record_agent(name, role_ms, len(produced))
+    for action in produced:
+        world.store.emit(action.get("kind", "action"), action, name)
+    return result
 
 
 def _maybe_write_weekly_report(world: World) -> None:
@@ -152,104 +258,51 @@ def step(world: World) -> dict[str, Any]:
     actions: list[dict[str, Any]] = []
     error_count = 0
     agent_ms: dict[str, float] = {}
-    from sovereign.agents import roles
-    from sovereign.comms.handlers import process_inbox
+    from sovereign.engine.workers import PIPELINE_NAMES, WAVES, WorkerPool
 
     # One aggregate query decides whose inbox gets pumped this tick; agents
     # with nothing queued skip process_inbox entirely.
     queued = world.store.queued_recipient_counts() if world.comms is not None else {}
     timeout_s = world.config.agent_timeout_seconds
 
-    def pump_inbox(agent: str) -> None:
-        """Timeout-guarded inbox pump: a wedged handler is abandoned with a
-        "comms_timeout" event instead of hanging the tick."""
-        nonlocal comms_ms, comms_processed
-        comms_started = time.monotonic()
-        try:
-            summaries = run_with_timeout(
-                lambda: process_inbox(world, agent), seconds=timeout_s, agent=agent
-            )
-        except AgentTimeout:
-            comms_ms += (time.monotonic() - comms_started) * 1000.0
-            world.store.emit("comms_timeout", {"agent": agent}, agent)
-            return
-        comms_ms += (time.monotonic() - comms_started) * 1000.0
-        comms_processed += len(summaries)
-        if summaries:
-            # Summaries carry ids/kinds/statuses only, never payload contents.
-            world.store.emit("comms", {"count": len(summaries), "results": summaries}, agent)
+    def execute(name: str) -> AgentTick:
+        tick = run_one_agent(
+            world,
+            name,
+            queued=queued,
+            timeout_s=timeout_s,
+            tracing=tracing,
+        )
+        agent_ms[name] = agent_ms.get(name, 0.0) + tick.ms
+        actions.extend(tick.actions)
+        nonlocal_errors[0] += tick.errors
+        comms_acc[0] += tick.comms_ms
+        comms_acc[1] += tick.comms_processed
+        return tick
 
-    pipeline = [
-        roles.mechanic,
-        roles.bookkeeper,
-        roles.risk,
-        roles.ethics,
-        roles.director,
-        roles.hunter,
-        roles.closer,
-        roles.crafter,
-        roles.trader,
-        roles.publisher,
-        roles.scout,
-        roles.operator,
-        roles.treasurer,
-        roles.auditor,
-        roles.improver,
-        roles.courier,
-    ]
-    for fn in pipeline:
-        name = fn.__name__
-        if name in world.frozen:
-            world.store.emit("skipped_frozen", {"agent": name}, name)
-            continue
-        if world.comms is not None and queued.get(name, 0) > 0:
-            pump_inbox(name)
-        agent_started = time.monotonic()
-        try:
-            # fn is bound as a lambda default so an abandoned worker that has
-            # not started yet can never late-bind to a later role in this loop.
-            produced = run_with_timeout(
-                lambda fn=fn: fn(world), seconds=timeout_s, agent=name
-            ) or []
-        except AgentTimeout:
-            # The wedged worker is abandoned (see watchdog docstring); the
-            # tick moves on. Elapsed is recorded as the full budget.
-            budget_ms = timeout_s * 1000.0
-            agent_ms[name] = agent_ms.get(name, 0.0) + budget_ms
-            error_count += 1
-            world.store.emit("agent_timeout", {"agent": name, "seconds": timeout_s}, name)
-            if tracing:
-                trace.record_agent(name, budget_ms, 0, error=f"timeout after {timeout_s:g}s")
-            world.reputation.slash(name, 3, f"timeout after {timeout_s:g}s")
-            if world.reputation.should_freeze(name):
-                world.freeze(name, f"timeout after {timeout_s:g}s", kind="runtime")
-            continue
-        except Exception as e:
-            role_ms = (time.monotonic() - agent_started) * 1000.0
-            agent_ms[name] = agent_ms.get(name, 0.0) + role_ms
-            error_count += 1
-            # Events keep only the short error string; the traceback tail
-            # goes to the trace file and nowhere else.
-            world.store.emit("agent_error", {"error": str(e)}, name)
-            if tracing:
-                trace.record_agent(
-                    name,
-                    role_ms,
-                    0,
-                    error=str(e),
-                    traceback_tail=traceback.format_exc()[-800:],
-                )
-            world.reputation.slash(name, 5, f"exception: {e}")
-            if world.reputation.should_freeze(name):
-                world.freeze(name, f"exception: {e}", kind="runtime")
-            continue
-        role_ms = (time.monotonic() - agent_started) * 1000.0
-        agent_ms[name] = agent_ms.get(name, 0.0) + role_ms
-        if tracing:
-            trace.record_agent(name, role_ms, len(produced))
-        actions.extend(produced)
-        for a in produced:
-            world.store.emit(a.get("kind", "action"), a, name)
+    nonlocal_errors = [0]
+    comms_acc = [0.0, 0]
+    if world.config.workers.enabled:
+        with WorkerPool(world.config) as pool:
+            for wave in WAVES:
+                names = tuple(name for name in wave if name in PIPELINE_NAMES)
+                for row in pool.run_wave(names, world, execute):
+                    if row.get("in_process"):
+                        continue
+                    if not row.get("ok"):
+                        nonlocal_errors[0] += int(row.get("errors") or 1)
+                        err = str(row.get("error") or "worker_failed")
+                        world.store.emit(
+                            "agent_error",
+                            {"error": err, "worker": True},
+                            str(row.get("agent") or "worker"),
+                        )
+    else:
+        for name in PIPELINE_NAMES:
+            execute(name)
+    error_count = nonlocal_errors[0]
+    comms_ms += comms_acc[0]
+    comms_processed += comms_acc[1]
 
     # The end-of-tick snapshot doubles as the idle signal and as the gate for
     # one same-tick catch-up pump: mail sent during the tick to an inbox that
@@ -259,14 +312,16 @@ def step(world: World) -> dict[str, Any]:
     queued_after = world.store.queued_recipient_counts() if world.comms is not None else {}
     if world.comms is not None:
         late = [
-            fn.__name__
-            for fn in pipeline
-            if fn.__name__ not in world.frozen
-            and queued_after.get(fn.__name__, 0) > 0
-            and queued.get(fn.__name__, 0) == 0
+            name
+            for name in PIPELINE_NAMES
+            if name not in world.frozen
+            and queued_after.get(name, 0) > 0
+            and queued.get(name, 0) == 0
         ]
         for name in late:
-            pump_inbox(name)
+            extra_ms, extra_n = _pump_inbox(world, name, timeout_s)
+            comms_ms += extra_ms
+            comms_processed += extra_n
         if late:
             queued_after = world.store.queued_recipient_counts()
 

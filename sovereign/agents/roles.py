@@ -936,6 +936,13 @@ def _strategy_warmup(strategy: Any) -> int:
 
 
 def trader(world: World) -> list[dict[str, Any]]:
+    trading = world.config.trading
+    if (
+        world.config.mode == "live"
+        and trading.venue == "hyperliquid"
+        and not trading.hyperliquid_enabled
+    ):
+        return [{"kind": "trade", "skipped": "hyperliquid_disabled", "venue": "hyperliquid"}]
     certified = [c for c in world.certified if c.get("certified")]
     if not certified:
         return [{"kind": "trade", "skipped": "none_certified"}]
@@ -982,11 +989,17 @@ def trader(world: World) -> list[dict[str, Any]]:
     prev = world.store.get_kv("trader_last_eq", eq)
     delta = eq - float(prev)
     world.store.set_kv("trader_last_eq", eq)
+    live_hl = (
+        world.config.mode == "live"
+        and trading.venue == "hyperliquid"
+        and trading.hyperliquid_enabled
+    )
+    income_account = "income.trading" if live_hl else "income.trading_paper"
     if abs(delta) >= 0.01:
         if delta > 0:
-            world.ledger.post("assets.trading_book", "income.trading_paper", delta, "mtm gain", ts=world.stamp())
+            world.ledger.post("assets.trading_book", income_account, delta, "mtm gain", ts=world.stamp())
         else:
-            world.ledger.post("income.trading_paper", "assets.trading_book", -delta, "mtm loss", ts=world.stamp())
+            world.ledger.post(income_account, "assets.trading_book", -delta, "mtm loss", ts=world.stamp())
     lesson_error = None
     if isinstance(fill, dict) and fill.get("ok"):
         lesson_error = _remember_lesson(

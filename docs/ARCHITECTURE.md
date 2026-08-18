@@ -18,22 +18,24 @@ Consolidating them is a product decision, not a missing import.
 ## Process topology
 
 ```
-sovereign serve
+sovereign serve [--workers]
   └── heartbeat tick
-        ├── mechanic (first)
-        ├── bookkeeper / risk / ethics / director
-        ├── hunter → closer → crafter → treasurer
-        ├── trader / publisher / scout / operator
-        ├── auditor / improver
-        └── courier (last)
+        ├── mechanic (always in-process)
+        ├── bookkeeper / risk+ethics / director
+        ├── hunter → closer → crafter
+        ├── trader / publisher+scout+operator
+        ├── treasurer+auditor+improver
+        └── courier (typically in-process)
 ```
 
 - One `FileLock` (`data/engine.lock`) so two hearts cannot beat on one DB.
 - Agents are Python functions over a shared `World`, not VMs or containers.
 - Isolation is the tool registry, the Claude craft jail, freezes/quorum,
   and a per-agent watchdog timeout — not a desktop per role.
-- The durable `messages` bus is already the boundary a future per-agent
-  worker would consume. See [`RUNTIME.md`](RUNTIME.md) "Scaling path".
+- `workers.enabled` (or `sovereign serve --workers`) may spawn processes
+  for agents not in `workers.in_process`. Children reopen SQLite; they
+  never pickle `World` and never call `start_tick` / `finish_tick`.
+  See [`RUNTIME.md`](RUNTIME.md) and [`TRADING.md`](TRADING.md).
 
 ## Persistence
 
@@ -70,7 +72,9 @@ either `data/master.key` (default) or the OS keyring
   `models.provider: api` or `allow_api_fallback` is set.
 - Tool grants come from `AgentSpec` (`sovereign/agents/spec.py`). Drift
   fails at import/startup.
-- Optional extras: `[mail]`, `[web]`, `[mcp]`, `[keyring]`.
+- Optional extras: `[mail]`, `[web]`, `[mcp]`, `[keyring]`, `[hyperliquid]`.
+- Live venue is Hyperliquid only (fail-closed; sim stays paper). See
+  [`TRADING.md`](TRADING.md).
 
 ## What this wave added
 
@@ -84,8 +88,6 @@ either `data/master.key` (default) or the OS keyring
 
 These are not implemented here and should not be inferred from the docs:
 
-- Multi-process per-agent workers (bus is ready; the supervisor is not)
-- Live exchange order placement (paper broker + certified signals only)
 - Fiat rails (Stripe invoicing, refunds, chargebacks)
 - Site-specific adapters (Upwork/LinkedIn portals)
 - KMS beyond the OS keyring

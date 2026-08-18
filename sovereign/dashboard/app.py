@@ -219,7 +219,7 @@ async function tick() {
     byId('wallet').textContent = JSON.stringify({wallet:s.wallet, credentials:s.credentials_present}, null, 2);
     byId('inbox').textContent = JSON.stringify(s.human_inbox, null, 2);
     byId('inv').textContent = JSON.stringify({open:s.invoices_open, paid:s.invoices_paid, offers:s.offers}, null, 2);
-    byId('strat').textContent = JSON.stringify({certified:s.certified_strategies, rejected:s.rejected_strategies}, null, 2);
+    byId('strat').textContent = JSON.stringify({trading:s.trading, certified:s.certified_strategies, rejected:s.rejected_strategies, broker:s.broker}, null, 2);
     byId('agents').textContent = JSON.stringify({frozen:s.frozen_agents, reputation:s.reputation, broker:s.broker}, null, 2);
     const toolCount = (s.tools && s.tools.names) ? s.tools.names.length : 0;
     byId('health').textContent = JSON.stringify({health:s.health, tools: toolCount, skills:s.skills}, null, 2);

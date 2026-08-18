@@ -1,3 +1,5 @@
+import json
+
 from sovereign.cli import _config, build_parser, main
 
 
@@ -25,6 +27,18 @@ def test_cli_loads_yaml_with_cli_globals_winning(tmp_path):
     assert config.daily_apply_cap == 3
     assert config.tick_seconds == 45
     assert config.mode == "sim"
+
+
+def test_cli_serve_workers_and_unknown_worker(tmp_path, capsys):
+    args = build_parser().parse_args(["serve", "--workers", "--ticks", "1"])
+    assert args.workers is True
+    code = main(
+        ["worker", "--data-dir", str(tmp_path), "--agent", "wizard", "--once"]
+    )
+    assert code == 1
+    envelope = json.loads(capsys.readouterr().err)
+    assert envelope["ok"] is False
+    assert "wizard" in envelope["error"]
 
 
 def test_cli_reports_clean_errors_and_requires_live_paid_confirmation(tmp_path, capsys):

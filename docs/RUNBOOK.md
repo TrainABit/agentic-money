@@ -12,7 +12,13 @@ sovereign healthcheck --data-dir data --stale-seconds 300
 sovereign status --data-dir data
 sovereign comms --status dead
 sovereign alerts
+sovereign trading --data-dir data
 ```
+
+Live Hyperliquid is fail-closed (`trading.hyperliquid_enabled: false`,
+testnet default). See [`TRADING.md`](TRADING.md). `sovereign trading`
+never prints keys. Enable multi-process waves with `workers.enabled` or
+`sovereign serve --workers`.
 
 `healthcheck` never raises: exit 0 means ready (and not stale when a bound
 is set). Use it as a Docker `HEALTHCHECK` or a systemd timer.

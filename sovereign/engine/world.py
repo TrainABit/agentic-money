@@ -251,20 +251,7 @@ class World:
             self.reputation.scores = {k: float(v) for k, v in meta["reputation"].items()}
         b = meta.get("broker") or {}
         if b:
-            self.broker.cash = float(b.get("cash", self.broker.cash))
-            self.broker.position = float(b.get("position", 0))
-            self.broker.last_price = float(b.get("last_price", 0))
-            self.broker.frozen = bool(b.get("frozen", False))
-            self.broker.day_start_equity = float(b.get("day_start_equity") or 0)
-            self.broker.week_start_equity = float(b.get("week_start_equity") or 0)
-            self.broker.day_key = str(b.get("day_key") or "")
-            self.broker.week_key = str(b.get("week_key") or "")
-            ht = b.get("halt_tick")
-            self.broker.halt_tick = int(ht) if ht is not None else None
-            self.broker.halted_at = parse_datetime(b.get("halted_at"))
-            self.broker.halt_reason = str(b.get("halt_reason") or "") or None
-            if self.broker.frozen and self.broker.halted_at is None:
-                self.broker.halted_at = self.now
+            self.broker.restore(b, now=self.now)
         self.last_prices = dict(meta.get("last_prices") or {})
         self.freeze_since = {k: int(v) for k, v in (meta.get("freeze_since") or {}).items()}
         self.freeze_info = {
@@ -349,6 +336,14 @@ class World:
                 "servers": (self.mcp.servers() if self.mcp else []),
                 "errors": (len(self.mcp.errors()) if self.mcp else 0),
             },
+            "trading": {
+                "venue": self.config.trading.venue,
+                "coin": self.config.trading.coin,
+                "hyperliquid_enabled": self.config.trading.hyperliquid_enabled,
+                "testnet": self.config.trading.hyperliquid_testnet,
+                "allow_mainnet": self.config.trading.hyperliquid_allow_mainnet,
+                "workers_enabled": self.config.workers.enabled,
+            },
             "tools": None if self.tools is None else {
                 "names": self.tools.names(),
                 "by_agent": {a: self.tools.available_to(a) for a in (
@@ -358,6 +353,12 @@ class World:
                 )},
             },
         }
+
+
+def _build_broker(config: EngineConfig, wallet: Any) -> PaperBroker:
+    from sovereign.markets.hyperliquid import build_broker
+
+    return build_broker(config, wallet)
 
 
 def bootstrap(config: EngineConfig, *, heal: bool = True, clock: Clock | None = None) -> World:
@@ -404,7 +405,7 @@ def bootstrap(config: EngineConfig, *, heal: bool = True, clock: Clock | None = 
         council=Council(store),
         reputation=Reputation(store.get_kv("meta", {}).get("reputation") if store.get_kv("meta") else {}),
         human=HumanInbox(paths),
-        broker=PaperBroker(cash=0.0),
+        broker=_build_broker(config, wallet),
         clock=active_clock,
         now=initial_now,
         identity={
@@ -504,7 +505,22 @@ def load_prices(world: World, force: bool = False) -> None:
     source = "synthetic"
     if world.config.mode == "live" and world.config.fetch_market_data:
         try:
-            closes, source = fetch_closes()
+            if world.config.trading.venue == "hyperliquid":
+                from sovereign.markets.hyperliquid import (
+                    build_info_client,
+                    fetch_hyperliquid_closes,
+                )
+
+                try:
+                    closes = fetch_hyperliquid_closes(
+                        world.config.trading.coin,
+                        client=build_info_client(world.config),
+                    )
+                    source = "hyperliquid"
+                except Exception:
+                    closes, source = fetch_closes()
+            else:
+                closes, source = fetch_closes()
             if len(closes) == 0:
                 raise ValueError("market source returned no closes")
             world.store.emit("market_fetch", {"source": source, "n": int(len(closes))}, "trader")

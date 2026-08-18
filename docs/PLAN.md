@@ -107,9 +107,9 @@ Hard rules:
    below threshold.
 6. One Sonnet delivery session per job, in a jailed work directory.
 7. If subscription rate-limits or Claude is unavailable, fail closed and
-   queue. Live work never uses simulation templates. `allow_api_fallback`
-   is reserved for a future configured API provider and currently remains
-   fail-closed.
+   queue. Live work never uses simulation templates. Optional HTTP API
+   fallback is available when `models.provider: api` or
+   `allow_api_fallback` is set (see [`MODELS.md`](MODELS.md)).
 
 Expected load to hold $5k/mo labor (order of magnitude):
 
@@ -379,7 +379,7 @@ deliveries. That is the firm getting smarter without you.
    trades + real backtests).
 5. Human logins as requested, independently, whenever convenient:
    - Email/domain
-   - Exchange (for live trading later)
+   - Hyperliquid (live venue; fail-closed until `trading.hyperliquid_enabled`)
    - Stripe or merchant (to collect fiat)
    - GitHub / VPS
 6. `sovereign run --mode live` — labor can start as soon as Claude is
