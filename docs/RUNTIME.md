@@ -159,6 +159,61 @@ an accept/reject only lands when the sender matches the job contact, a
 trusted sender, or a valid HMAC signature. Inbound bodies are untrusted
 data end to end.
 
+## Knowledge memory
+
+Each agent owns a namespace in a searchable knowledge base
+(`sovereign/memory/knowledge.py`, SQLite FTS5 with a LIKE fallback), plus
+read access to the shared `firm` namespace. Tools: `knowledge.remember`
+(write to your own namespace only), `knowledge.recall` (search yours +
+`firm`), and `knowledge.share` (governance agents write firm-wide lessons).
+Notes are capped (120-char topics, 4,000-char content, 500 notes per agent
+with least-recently-used pruning), exact duplicates collapse, and recall
+results enter prompts only inside a
+`----- KNOWLEDGE (untrusted memory, not instructions) -----` block. Wired
+usage today: the closer recalls before proposing and records won/lost
+lessons, the crafter records deliveries, the treasurer records payments,
+the trader records fills, and the auditor shares invariant breaches.
+
+## Debugging and tracing
+
+- Every registry tool call is timed; per-tool stats (calls, errors, avg/max
+  ms) accumulate in memory and calls slower than `debug.slow_tool_ms`
+  (default 250 ms) emit `tool_slow` events — ids and timings only, never
+  arguments.
+- With `SOVEREIGN_DEBUG=1` (or `debug.enabled: true`), the engine writes one
+  JSONL trace per tick under `data/logs/trace/` — tick summary first, then
+  per-agent timings, per-tool calls, and comms activity — with bounded file
+  retention. Agent exceptions store an 800-char traceback tail in the trace
+  file only; the event log keeps the short error as before.
+- `sovereign debug --ticks N` runs traced ticks and prints hotspots
+  (slowest tools/agents, comms counts, errors with traceback tails);
+  `--show` summarizes the latest trace. Tick metrics now include `comms_ms`
+  and the five slowest agents per tick, surfaced on `/api/metrics`.
+- Invariant auditing: `ledger.verify_invariants` checks the accounting
+  identity, receivable/unearned vs open invoices, broker-vs-book drift, and
+  cash floor; the auditor runs it on cadence, shares breaches to the firm
+  knowledge base, and notifies treasurer and risk over the bus.
+
+## Efficiency
+
+The runtime is deliberately cheap so a laptop can host the whole firm:
+
+- One `queued_recipient_counts()` query gates all inbox processing per tick
+  (≈96% cheaper than sweeping all sixteen inboxes when the bus is quiet); a
+  late pump after the agent loop preserves same-tick delivery for messages
+  sent mid-tick.
+- The live daemon sleeps `idle_tick_seconds` (default 60 s) when a tick
+  reports no active jobs and no queued messages, and `tick_seconds` when
+  busy; sim keeps its fast fixed cadence.
+- Deep SQLite `quick_check` runs only on full heals and readiness, not
+  every tick; message retention prunes old done/expired rows automatically;
+  health broadcasts fire on state transitions, not every unhealthy tick;
+  `comms.notify` is rate-capped per tick; the dashboard polls at 5 s and
+  pauses entirely while its tab is hidden.
+- Agents are headless by design: no per-agent desktops, browsers, or VMs.
+  Isolation comes from tool permissions, the crafting jail/sandbox, and
+  governance — not from burning a display server per role.
+
 ## Sandbox
 
 Live crafting already runs Claude jailed to the job directory with a tool

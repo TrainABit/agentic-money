@@ -38,6 +38,7 @@ sovereign backtest --live-data           # certify strategies on public BTC
 sovereign dashboard                      # observer: pipeline, invoices, wallets, health, metrics
 sovereign comms --status dead            # inspect bus messages; --requeue / --purge-days
 sovereign backup --out /path/backup      # online SQLite backup + manifest; --verify checks it
+sovereign debug --ticks 3                # traced ticks: slowest tools/agents, comms, errors
 ```
 
 The dashboard is unauthenticated only on its default loopback bind. Every
@@ -82,6 +83,22 @@ outbox. With AgentMail configured, the courier also polls the inbox on a
 authorized drop-in pipeline used for file leads — sender authorization still
 gates every accept/reject, and a transport failure queues the message with
 the error instead of losing it.
+
+Agents keep a searchable knowledge base (SQLite FTS5, LIKE fallback) with
+per-agent namespaces plus a shared `firm` namespace: the closer recalls
+won/lost-job lessons into its proposal prompts, the crafter/treasurer/trader
+record deliveries, payments, and fills, and governance agents can share firm
+lessons. Notes are size-capped, deduplicated, LRU-pruned at 500 per agent,
+and always injected into prompts as delimited untrusted data.
+
+Debugging is built in: every tool call is timed (slow calls emit `tool_slow`
+events), `SOVEREIGN_DEBUG=1` or `debug.enabled` writes per-tick JSONL traces
+with per-agent timings and full traceback tails (trace files only — never
+the event log), and `sovereign debug --ticks N` prints hotspots. The engine
+stays light by design: inbox processing is gated on one queued-count query
+per tick, the live daemon sleeps `idle_tick_seconds` (default 60s) when
+there is no work, deep SQLite integrity checks run only on full heals, and
+the dashboard pauses polling in hidden tabs.
 
 Jailed live crafting is additionally wrapped in a bubblewrap filesystem
 sandbox when `bwrap` is installed (`models.sandbox: auto`, the default):
