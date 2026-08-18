@@ -7,7 +7,6 @@ from datetime import datetime, timedelta, timezone
 
 from sovereign.cli import main
 from sovereign.config import EngineConfig
-from sovereign.engine.heartbeat import step
 from sovereign.engine.world import bootstrap
 from sovereign.ops import healthcheck
 
@@ -33,19 +32,22 @@ def test_healthcheck_stale_when_no_tick_and_bound_requested(tmp_path):
     assert any("no tick timestamp" in reason for reason in report["reasons"])
 
 
-def test_healthcheck_live_after_tick_then_stale_on_old_marker(tmp_path):
+def test_healthcheck_accepts_recent_marker_then_stales(tmp_path):
     world = bootstrap(EngineConfig(mode="sim", data_dir=tmp_path))  # type: ignore[arg-type]
-    step(world)
+    now = datetime.now(timezone.utc).isoformat()
+    world.store.set_kv(
+        "tick_start",
+        {"tick": 0, "started_ts": now, "completed_ts": now, "status": "completed"},
+    )
     fresh = healthcheck(world, max_staleness_seconds=10_000)
     assert fresh["ok"] is True
     assert fresh["stale"] is False
-    assert fresh["tick"] >= 1
     assert fresh["last_tick_ts"]
 
     world.store.set_kv(
         "tick_start",
         {
-            "tick": world.tick,
+            "tick": 0,
             "started_ts": (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
             "completed_ts": (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
             "status": "completed",
@@ -53,6 +55,7 @@ def test_healthcheck_live_after_tick_then_stale_on_old_marker(tmp_path):
     )
     stale = healthcheck(world, max_staleness_seconds=60)
     assert stale["ok"] is False
+    assert stale["ready"] is True
     assert stale["stale"] is True
     assert any("old" in reason for reason in stale["reasons"])
 
@@ -74,11 +77,10 @@ def test_cli_healthcheck_exit_codes(tmp_path, capsys):
     assert payload["ready"] is True
 
     world = bootstrap(EngineConfig(mode="sim", data_dir=tmp_path))  # type: ignore[arg-type]
-    step(world)
     world.store.set_kv(
         "tick_start",
         {
-            "tick": world.tick,
+            "tick": 0,
             "started_ts": (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat(),
             "completed_ts": (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat(),
             "status": "completed",

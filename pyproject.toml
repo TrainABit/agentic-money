@@ -57,6 +57,7 @@ include = ["sovereign*"]
 testpaths = ["tests"]
 addopts = "-q"
 pythonpath = ["."]
+markers = ["slow: bounded soak or other longer runs kept in the default suite"]
 
 [tool.ruff]
 line-length = 100

@@ -315,7 +315,9 @@ def healthcheck(
         marker = world.store.get_kv("tick_start")
         marker = marker if isinstance(marker, dict) else {}
         try:
-            tick = max(tick, int(marker.get("tick")))
+            marked = marker.get("tick")
+            if marked is not None:
+                tick = max(tick, int(marked))
         except (TypeError, ValueError):
             pass
         newest: datetime | None = None
