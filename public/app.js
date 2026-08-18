@@ -146,6 +146,45 @@ function renderTransactionPagination(pagination) {
   byId("transactions-next").disabled = !pagination.hasMore;
 }
 
+function renderHyperliquid(snapshot) {
+  const list = byId("hl-mids");
+  const meta = byId("hl-meta");
+  const account = byId("hl-account");
+  list.replaceChildren();
+  const host = (() => {
+    try {
+      return new URL(snapshot.infoUrl).host;
+    } catch {
+      return "hyperliquid";
+    }
+  })();
+  meta.textContent = `Read-only mids from ${host}. No keys in this app.`;
+  const coins = snapshot.coins.length > 0 ? snapshot.coins : Object.keys(snapshot.mids);
+  for (const coin of coins) {
+    const item = document.createElement("li");
+    const name = document.createElement("span");
+    name.className = "hl-coin";
+    name.textContent = coin;
+    const px = document.createElement("span");
+    px.className = "hl-px";
+    const mid = snapshot.mids[coin];
+    px.textContent = Number.isFinite(mid) ? fmt(mid) : "—";
+    item.append(name, px);
+    list.appendChild(item);
+  }
+  if (coins.length === 0) {
+    list.appendChild(emptyMessage("No Hyperliquid mids yet.", "li"));
+  }
+  if (snapshot.address) {
+    const equity = Number.isFinite(snapshot.accountValue)
+      ? fmt(snapshot.accountValue)
+      : "—";
+    account.textContent = `Account ${snapshot.address} · equity ${equity}`;
+  } else {
+    account.textContent = "";
+  }
+}
+
 function renderBudgets(budgets) {
   const list = byId("budgets");
   list.replaceChildren();
@@ -183,12 +222,13 @@ function errorMessage(error) {
 }
 
 async function refresh() {
-  const [summary, transactionPage, budgets] = await Promise.all([
+  const [summary, transactionPage, budgets, hyperliquid] = await Promise.all([
     api("/api/summary"),
     api(
       `/api/transactions?limit=${TRANSACTION_PAGE_SIZE}&offset=${transactionOffset}`,
     ),
     api("/api/budgets"),
+    api("/api/hyperliquid").catch(() => null),
   ]);
   renderStats(summary);
   renderInsights(summary);
@@ -196,6 +236,14 @@ async function refresh() {
   renderTransactions(transactionPage.data);
   renderTransactionPagination(transactionPage.pagination);
   renderBudgets(budgets);
+  if (hyperliquid) {
+    renderHyperliquid(hyperliquid);
+  } else {
+    byId("hl-meta").textContent =
+      "Hyperliquid mids unavailable. The rest of the dashboard still works.";
+    byId("hl-mids").replaceChildren();
+    byId("hl-account").textContent = "";
+  }
 }
 
 async function navigateTransactions(offset) {

@@ -1,5 +1,6 @@
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { DEFAULT_COINS, DEFAULT_INFO_URL } from "./hyperliquid.js";
 
 export const PROJECT_ROOT = resolve(
   dirname(fileURLToPath(import.meta.url)),
@@ -28,6 +29,9 @@ export interface RuntimeConfig {
   seedDemo: boolean;
   rateLimit: number;
   trustProxy: number;
+  hyperliquidInfoUrl: string;
+  hyperliquidCoins: string[];
+  hyperliquidAddress?: string;
 }
 
 export class ConfigurationError extends Error {
@@ -60,6 +64,8 @@ export function loadConfig(
     0,
   );
 
+  rejectHyperliquidSecrets(environment);
+
   assertSecureRuntimeConfig({ host, apiToken, resetEnabled });
 
   const configuredDataFile = optionalNonEmpty(
@@ -87,6 +93,17 @@ export function loadConfig(
     seedDemo,
     rateLimit,
     trustProxy,
+    hyperliquidInfoUrl:
+      optionalNonEmpty(environment.HYPERLIQUID_INFO_URL, "HYPERLIQUID_INFO_URL") ??
+      DEFAULT_INFO_URL,
+    hyperliquidCoins: parseCoinList(
+      environment.HYPERLIQUID_COINS,
+      "HYPERLIQUID_COINS",
+    ),
+    hyperliquidAddress: optionalNonEmpty(
+      environment.HYPERLIQUID_ADDRESS,
+      "HYPERLIQUID_ADDRESS",
+    ),
   };
 }
 
@@ -174,4 +191,35 @@ function optionalNonEmpty(
 
 function resolveFromProject(path: string): string {
   return isAbsolute(path) ? path : resolve(PROJECT_ROOT, path);
+}
+
+const FORBIDDEN_HYPERLIQUID_ENV = [
+  "HYPERLIQUID_PRIVATE_KEY",
+  "HYPERLIQUID_SECRET",
+  "HL_SECRET_KEY",
+  "HL_PRIVATE_KEY",
+] as const;
+
+function rejectHyperliquidSecrets(environment: NodeJS.ProcessEnv): void {
+  for (const name of FORBIDDEN_HYPERLIQUID_ENV) {
+    if (environment[name] !== undefined && environment[name] !== "") {
+      throw new ConfigurationError(
+        `${name} is not supported; this app is a read-only Hyperliquid client`,
+      );
+    }
+  }
+}
+
+function parseCoinList(value: string | undefined, name: string): string[] {
+  if (value === undefined || value.trim().length === 0) {
+    return [...DEFAULT_COINS];
+  }
+  const coins = value
+    .split(",")
+    .map((coin) => coin.trim().toUpperCase())
+    .filter((coin) => coin.length > 0);
+  if (coins.length === 0) {
+    throw new ConfigurationError(`${name} cannot be empty`);
+  }
+  return [...new Set(coins)];
 }

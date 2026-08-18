@@ -235,12 +235,16 @@ describe("agentic-money API", () => {
       "default-src 'self'",
     );
     expect(dashboard.text).toContain("Manage budgets");
+    expect(dashboard.text).toContain("Hyperliquid");
+    expect(dashboard.text).toContain('id="hl-mids"');
     expect(dashboard.text).toContain('id="transactions-previous"');
     expect(dashboard.text).toContain('id="transactions-page"');
     expect(dashboard.text).toContain('id="transactions-next"');
     expect(script.status).toBe(200);
     expect(script.text).toContain("textContent");
     expect(script.text).toContain("pagination.hasMore");
+    expect(script.text).toContain("/api/hyperliquid");
+    expect(script.text).toContain("renderHyperliquid");
     expect(script.text).not.toContain("localStorage");
     expect(script.text).not.toContain("sessionStorage");
     expect(script.text).not.toContain("innerHTML");
@@ -274,6 +278,65 @@ describe("agentic-money API", () => {
     expect(limited.status).toBe(429);
     expect(limited.body.error.code).toBe("rate_limit_exceeded");
     expect(limited.headers["ratelimit"]).toBeTruthy();
+  });
+
+  it("exposes a read-only Hyperliquid snapshot from an injected client", async () => {
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { type?: string };
+      if (body.type === "allMids") {
+        return new Response(JSON.stringify({ BTC: "65000.5", ETH: "3500.25" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (body.type === "clearinghouseState") {
+        return new Response(
+          JSON.stringify({
+            marginSummary: { accountValue: "12.5" },
+            assetPositions: [
+              { position: { coin: "BTC", szi: "0.01", entryPx: "64000" } },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response("unexpected", { status: 500 });
+    };
+    app = createApp(store, {
+      rateLimit: false,
+      hyperliquid: {
+        coins: ["BTC", "ETH"],
+        address: "0xabc",
+        fetchImpl,
+      },
+    });
+
+    const res = await request(app).get("/api/hyperliquid");
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      venue: "hyperliquid",
+      mids: { BTC: 65000.5, ETH: 3500.25 },
+      address: "0xabc",
+      accountValue: 12.5,
+    });
+    expect(res.body.positions).toEqual([
+      { coin: "BTC", size: 0.01, entryPx: 64000 },
+    ]);
+    expect(JSON.stringify(res.body)).not.toMatch(/private|secret|mnemonic/i);
+  });
+
+  it("returns 502 when Hyperliquid info is unavailable", async () => {
+    app = createApp(store, {
+      rateLimit: false,
+      hyperliquid: {
+        fetchImpl: async () => {
+          throw new Error("network down");
+        },
+      },
+    });
+    const res = await request(app).get("/api/hyperliquid");
+    expect(res.status).toBe(502);
+    expect(res.body.error.code).toBe("hyperliquid_unavailable");
   });
 
   it("returns 503 when persistent storage is unavailable", async () => {
