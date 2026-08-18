@@ -33,9 +33,11 @@ sovereign doctor --fix                   # same heal + CLI/wallet checks
 sovereign tools --agent mechanic         # permissioned tool bus
 sovereign agents --agent closer          # roster: mission, tier, tools, prompt, inbox
 sovereign run --ticks 30                 # sim marketplace + paper trading
-sovereign serve --mode live              # daemon, file-locked, crash-heals
+sovereign serve --mode live              # daemon; refuses unready live starts (--force overrides)
 sovereign backtest --live-data           # certify strategies on public BTC
-sovereign dashboard                      # observer: pipeline, invoices, wallets, health
+sovereign dashboard                      # observer: pipeline, invoices, wallets, health, metrics
+sovereign comms --status dead            # inspect bus messages; --requeue / --purge-days
+sovereign backup --out /path/backup      # online SQLite backup + manifest; --verify checks it
 ```
 
 The dashboard is unauthenticated only on its default loopback bind. Every
@@ -71,6 +73,22 @@ an all-rejected or insufficient-data report still moves to the weekly cadence.
 These defaults are configurable through `live_timing.price_refresh_hours`,
 `live_timing.certification_retry_hours`, and
 `live_timing.recertify_hours`.
+
+Outbound mail picks the first configured transport: AgentMail (vault
+credentials `AGENTMAIL_API_KEY` + `AGENTMAIL_INBOX_ID`, installed with
+`pip install -e ".[mail]"`), then SMTP (`SMTP_HOST` …), then the local file
+outbox. With AgentMail configured, the courier also polls the inbox on a
+`live_timing.mail_poll_minutes` cadence and turns new messages into the same
+authorized drop-in pipeline used for file leads — sender authorization still
+gates every accept/reject, and a transport failure queues the message with
+the error instead of losing it.
+
+Jailed live crafting is additionally wrapped in a bubblewrap filesystem
+sandbox when `bwrap` is installed (`models.sandbox: auto`, the default):
+the whole filesystem is read-only except the job's work directory and the
+Claude session state, with a private `/tmp`. Set `models.sandbox: bwrap`
+to make the sandbox mandatory (fails closed without bubblewrap) or `off`
+to disable.
 
 Live labor loop (no auto-pay):
 
