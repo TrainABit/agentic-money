@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import json
+import re
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -47,6 +48,50 @@ def usdc_amount(value: int) -> float:
     return int(value) / 1_000_000
 
 
+_SEARCH_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _search_tokens(query: str) -> list[str]:
+    """Reduce free text to lowercase [a-z0-9]+ tokens, deduped in order.
+
+    This is the only shape ever passed to FTS5 MATCH (each token quoted,
+    OR-joined), so operators/wildcards in raw queries cannot inject syntax.
+    """
+    return list(dict.fromkeys(_SEARCH_TOKEN_RE.findall(str(query).lower())))
+
+
+_MESSAGES_INSERT_SQL = """
+    INSERT INTO messages(
+      id, ts, thread_id, correlation_id, sender, recipient, kind, payload,
+      status, expects_reply, reply_to, deadline, attempts, max_attempts, error
+    )
+    VALUES(
+      :id, :ts, :thread_id, :correlation_id, :sender, :recipient, :kind, :payload,
+      :status, :expects_reply, :reply_to, :deadline, :attempts, :max_attempts, :error
+    )
+"""
+
+
+def _message_params(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": record["id"],
+        "ts": record["ts"],
+        "thread_id": record["thread_id"],
+        "correlation_id": record["correlation_id"],
+        "sender": record["sender"],
+        "recipient": record["recipient"],
+        "kind": record["kind"],
+        "payload": json.dumps(record.get("payload", {})),
+        "status": record.get("status", "queued"),
+        "expects_reply": 1 if record.get("expects_reply") else 0,
+        "reply_to": record.get("reply_to"),
+        "deadline": record.get("deadline"),
+        "attempts": int(record.get("attempts", 0)),
+        "max_attempts": int(record.get("max_attempts", 3)),
+        "error": record.get("error"),
+    }
+
+
 class Store:
     def __init__(self, db_path: Path, event_retention: int | None = 10_000) -> None:
         self.db_path = db_path
@@ -56,6 +101,7 @@ class Store:
         self._local = threading.local()
         self._savepoint_seq = 0
         self._ledger_revision = 0
+        self.fts_enabled: bool = False
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30.0)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA busy_timeout=30000")
@@ -226,6 +272,17 @@ class Store:
                   max_attempts INTEGER NOT NULL DEFAULT 3,
                   error TEXT
                 );
+                CREATE TABLE IF NOT EXISTS knowledge (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  ts TEXT NOT NULL,
+                  agent TEXT NOT NULL,
+                  topic TEXT NOT NULL,
+                  content TEXT NOT NULL,
+                  source TEXT NOT NULL,
+                  confidence REAL NOT NULL,
+                  use_count INTEGER NOT NULL DEFAULT 0,
+                  last_used_ts TEXT
+                );
                 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
                 CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status);
                 CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);
@@ -233,8 +290,57 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_messages_recipient_status ON messages(recipient, status);
                 CREATE INDEX IF NOT EXISTS idx_messages_correlation ON messages(correlation_id);
                 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id);
+                CREATE INDEX IF NOT EXISTS idx_messages_status_deadline ON messages(status, deadline);
+                CREATE INDEX IF NOT EXISTS idx_knowledge_agent_ts ON knowledge(agent, ts);
                 """
             )
+            self.conn.commit()
+            self._migrate_fts()
+
+    def _migrate_fts(self) -> None:
+        """Feature-detect FTS5 and build the external-content knowledge index.
+
+        On builds without the fts5 module the CREATE VIRTUAL TABLE raises
+        OperationalError; ``fts_enabled`` stays False and search degrades to
+        LIKE/recency. Any partially created objects are dropped so knowledge
+        writes never trip over an orphaned trigger.
+        """
+        try:
+            self.conn.executescript(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
+                  topic, content, content='knowledge', content_rowid='id'
+                );
+                CREATE TRIGGER IF NOT EXISTS knowledge_fts_ai AFTER INSERT ON knowledge BEGIN
+                  INSERT INTO knowledge_fts(rowid, topic, content)
+                  VALUES (new.id, new.topic, new.content);
+                END;
+                CREATE TRIGGER IF NOT EXISTS knowledge_fts_ad AFTER DELETE ON knowledge BEGIN
+                  INSERT INTO knowledge_fts(knowledge_fts, rowid, topic, content)
+                  VALUES ('delete', old.id, old.topic, old.content);
+                END;
+                CREATE TRIGGER IF NOT EXISTS knowledge_fts_au AFTER UPDATE ON knowledge BEGIN
+                  INSERT INTO knowledge_fts(knowledge_fts, rowid, topic, content)
+                  VALUES ('delete', old.id, old.topic, old.content);
+                  INSERT INTO knowledge_fts(rowid, topic, content)
+                  VALUES (new.id, new.topic, new.content);
+                END;
+                """
+            )
+            self.conn.commit()
+            self.fts_enabled = True
+        except sqlite3.OperationalError:
+            self.fts_enabled = False
+            for stmt in (
+                "DROP TRIGGER IF EXISTS knowledge_fts_ai",
+                "DROP TRIGGER IF EXISTS knowledge_fts_ad",
+                "DROP TRIGGER IF EXISTS knowledge_fts_au",
+                "DROP TABLE IF EXISTS knowledge_fts",
+            ):
+                try:
+                    self.conn.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass
             self.conn.commit()
 
     def emit(self, kind: str, payload: dict[str, Any], agent: str | None = None) -> None:
@@ -488,35 +594,27 @@ class Store:
         return [json.loads(r["payload"]) for r in rows]
 
     def insert_message(self, record: dict[str, Any]) -> None:
-        self._execute_write(
-            """
-            INSERT INTO messages(
-              id, ts, thread_id, correlation_id, sender, recipient, kind, payload,
-              status, expects_reply, reply_to, deadline, attempts, max_attempts, error
-            )
-            VALUES(
-              :id, :ts, :thread_id, :correlation_id, :sender, :recipient, :kind, :payload,
-              :status, :expects_reply, :reply_to, :deadline, :attempts, :max_attempts, :error
-            )
-            """,
-            {
-                "id": record["id"],
-                "ts": record["ts"],
-                "thread_id": record["thread_id"],
-                "correlation_id": record["correlation_id"],
-                "sender": record["sender"],
-                "recipient": record["recipient"],
-                "kind": record["kind"],
-                "payload": json.dumps(record.get("payload", {})),
-                "status": record.get("status", "queued"),
-                "expects_reply": 1 if record.get("expects_reply") else 0,
-                "reply_to": record.get("reply_to"),
-                "deadline": record.get("deadline"),
-                "attempts": int(record.get("attempts", 0)),
-                "max_attempts": int(record.get("max_attempts", 3)),
-                "error": record.get("error"),
-            },
-        )
+        self._execute_write(_MESSAGES_INSERT_SQL, _message_params(record))
+
+    def insert_messages(self, records: list[dict[str, Any]]) -> None:
+        """Insert many message rows (same columns as insert_message) atomically.
+
+        Uses one executemany under the store lock with a single commit at
+        transaction depth 0, so a failure anywhere in the batch persists
+        nothing.
+        """
+        if not records:
+            return
+        params = [_message_params(record) for record in records]
+        with self._lock:
+            try:
+                self.conn.executemany(_MESSAGES_INSERT_SQL, params)
+                if self._transaction_depth() == 0:
+                    self.conn.commit()
+            except BaseException:
+                if self._transaction_depth() == 0:
+                    self.conn.rollback()
+                raise
 
     def update_message(self, record: dict[str, Any]) -> None:
         """Update a message's mutable, payload-free fields by id."""
@@ -581,6 +679,14 @@ class Store:
             ).fetchall()
         return {r["status"]: int(r["n"]) for r in rows}
 
+    def queued_recipient_counts(self) -> dict[str, int]:
+        """Queued-message backlog per recipient in a single GROUP BY."""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT recipient, COUNT(*) AS n FROM messages WHERE status='queued' GROUP BY recipient"
+            ).fetchall()
+        return {str(r["recipient"]): int(r["n"]) for r in rows}
+
     def delete_messages(self, status_in: Sequence[str], older_than_ts: str) -> int:
         """Delete messages in the given statuses whose ts sorts before the cutoff.
 
@@ -607,6 +713,162 @@ class Store:
                     self.conn.rollback()
                 raise
         return int(cursor.rowcount)
+
+    def insert_knowledge(self, record: dict[str, Any]) -> int:
+        """Insert one knowledge note and return its rowid."""
+        with self._lock:
+            try:
+                cursor = self.conn.execute(
+                    """
+                    INSERT INTO knowledge(ts, agent, topic, content, source, confidence)
+                    VALUES(:ts, :agent, :topic, :content, :source, :confidence)
+                    """,
+                    {
+                        "ts": record["ts"],
+                        "agent": record["agent"],
+                        "topic": record["topic"],
+                        "content": record["content"],
+                        "source": record["source"],
+                        "confidence": float(record["confidence"]),
+                    },
+                )
+                if self._transaction_depth() == 0:
+                    self.conn.commit()
+            except BaseException:
+                if self._transaction_depth() == 0:
+                    self.conn.rollback()
+                raise
+        return int(cursor.lastrowid)
+
+    def search_knowledge(
+        self, agents: Sequence[str], query: str, limit: int = 5
+    ) -> list[dict[str, Any]]:
+        """Rank knowledge notes across the given agent namespaces for a query.
+
+        The raw query is neutralized into quoted OR-joined tokens before it
+        reaches FTS5 MATCH (see _search_tokens), ranked by bm25. Without FTS
+        the tokens fall back to LIKE over topic/content ordered by recency;
+        without any usable token both modes degrade to pure recency.
+        """
+        names = [str(a) for a in agents if a]
+        if not names or int(limit) <= 0:
+            return []
+        placeholders = ",".join("?" for _ in names)
+        tokens = _search_tokens(query)
+        with self._lock:
+            if tokens and self.fts_enabled:
+                match = " OR ".join(f'"{token}"' for token in tokens)
+                rows = self.conn.execute(
+                    f"""
+                    SELECT k.id, k.ts, k.agent, k.topic, k.content, k.source,
+                           k.confidence, k.use_count
+                    FROM knowledge_fts
+                    JOIN knowledge k ON k.id = knowledge_fts.rowid
+                    WHERE knowledge_fts MATCH ? AND k.agent IN ({placeholders})
+                    ORDER BY bm25(knowledge_fts) ASC, k.id DESC
+                    LIMIT ?
+                    """,
+                    (match, *names, int(limit)),
+                ).fetchall()
+            elif tokens:
+                token_filter = " OR ".join("(topic LIKE ? OR content LIKE ?)" for _ in tokens)
+                token_args = [arg for token in tokens for arg in (f"%{token}%", f"%{token}%")]
+                rows = self.conn.execute(
+                    f"""
+                    SELECT id, ts, agent, topic, content, source, confidence, use_count
+                    FROM knowledge
+                    WHERE agent IN ({placeholders}) AND ({token_filter})
+                    ORDER BY ts DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (*names, *token_args, int(limit)),
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    f"""
+                    SELECT id, ts, agent, topic, content, source, confidence, use_count
+                    FROM knowledge
+                    WHERE agent IN ({placeholders})
+                    ORDER BY ts DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (*names, int(limit)),
+                ).fetchall()
+        return [dict(r) for r in rows]
+
+    def touch_knowledge(self, ids: Sequence[int], ts: str) -> None:
+        """Bump use_count and stamp last_used_ts on the given knowledge rows."""
+        id_list = [int(i) for i in ids]
+        if not id_list:
+            return
+        placeholders = ",".join("?" for _ in id_list)
+        self._execute_write(
+            f"UPDATE knowledge SET use_count = use_count + 1, last_used_ts = ? "
+            f"WHERE id IN ({placeholders})",
+            (ts, *id_list),
+        )
+
+    def knowledge_count(self, agent: str) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM knowledge WHERE agent=?", (agent,)
+            ).fetchone()
+        return int(row["n"])
+
+    def knowledge_counts(self) -> dict[str, int]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT agent, COUNT(*) AS n FROM knowledge GROUP BY agent"
+            ).fetchall()
+        return {str(r["agent"]): int(r["n"]) for r in rows}
+
+    def prune_knowledge(self, agent: str, keep: int) -> int:
+        """Delete the agent's least-valuable knowledge rows beyond ``keep``.
+
+        Rows are kept by most recent activity (last_used_ts, else ts), with
+        higher use_count then newer id as tie-breaks; everything past ``keep``
+        in that order is deleted. The FTS index follows via the
+        external-content triggers (no-op when FTS is disabled). Returns the
+        number of rows removed.
+        """
+        if keep < 0:
+            raise ValueError("keep must be >= 0")
+        with self._lock:
+            try:
+                cursor = self.conn.execute(
+                    """
+                    DELETE FROM knowledge WHERE id IN (
+                      SELECT id FROM knowledge
+                      WHERE agent = ?
+                      ORDER BY COALESCE(last_used_ts, ts) DESC, use_count DESC, id DESC
+                      LIMIT -1 OFFSET ?
+                    )
+                    """,
+                    (agent, int(keep)),
+                )
+                if self._transaction_depth() == 0:
+                    self.conn.commit()
+            except BaseException:
+                if self._transaction_depth() == 0:
+                    self.conn.rollback()
+                raise
+        return int(cursor.rowcount)
+
+    def recent_knowledge(self, agent: str, limit: int = 200) -> list[dict[str, Any]]:
+        """Latest inserted notes for one agent, newest first (dedupe window)."""
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT id, ts, agent, topic, content, source, confidence,
+                       use_count, last_used_ts
+                FROM knowledge
+                WHERE agent = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (agent, int(limit)),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def upsert_offer(self, offer: dict[str, Any]) -> None:
         record = dict(offer)
