@@ -69,15 +69,57 @@ def jail_contains(child: Path, root: Path) -> bool:
         return False
 
 
+def sandbox_argv(argv: list[str], workdir: Path, *, home: Path | None = None) -> list[str]:
+    """Wrap a jailed subprocess in bubblewrap: whole FS read-only, job dir writable.
+
+    Network stays shared (the CLI talks to its provider), /tmp is a private
+    tmpfs, and only the job workdir plus the CLI's own session state under the
+    user's home are writable. This contains filesystem writes even if the
+    subprocess's internal tool policy fails.
+    """
+    home = home or Path.home()
+    wrapped = [
+        "bwrap",
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-pid",
+        "--ro-bind", "/", "/",
+        "--dev", "/dev",
+        "--proc", "/proc",
+        "--tmpfs", "/tmp",
+        "--bind", str(workdir), str(workdir),
+    ]
+    for session_path in (home / ".claude", home / ".claude.json"):
+        if session_path.exists():
+            wrapped += ["--bind", str(session_path), str(session_path)]
+    return wrapped + ["--", *argv]
+
+
 class ClaudeCodeProvider:
     MAX_OUTPUT_BYTES = 1024 * 1024
     ALL_TOOLS = ("Read", "Write", "Edit", "Glob", "Grep", "Bash", "Agent", "WebFetch", "WebSearch")
     CRAFT_TOOLS = ("Read", "Write", "Edit", "Glob", "Grep")
     CRAFT_DENIED_TOOLS = ("Bash", "Agent", "WebFetch", "WebSearch")
 
-    def __init__(self, bin_name: str = "claude", models: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        bin_name: str = "claude",
+        models: dict[str, str] | None = None,
+        sandbox: str = "auto",
+    ) -> None:
         self.bin_name = bin_name
         self.models = models or {"fast": "haiku", "work": "sonnet", "think": "opus"}
+        self.sandbox = sandbox
+
+    def _sandboxed(self, argv: list[str], workdir: Path) -> list[str]:
+        if self.sandbox == "off":
+            return argv
+        bwrap_available = shutil.which("bwrap") is not None
+        if not bwrap_available:
+            if self.sandbox == "bwrap":
+                raise RuntimeError("sandbox mode 'bwrap' requires bubblewrap on PATH")
+            return argv
+        return sandbox_argv(argv, workdir)
 
     def available(self) -> bool:
         return shutil.which(self.bin_name) is not None
@@ -170,7 +212,7 @@ class ClaudeCodeProvider:
             "--disallowedTools",
             "Bash,Agent,WebFetch,WebSearch",
         ]
-        return self._invoke(argv, cwd=resolved, timeout=timeout)
+        return self._invoke(self._sandboxed(argv, resolved), cwd=resolved, timeout=timeout)
 
 
 class Router:
@@ -180,6 +222,7 @@ class Router:
         self.claude = ClaudeCodeProvider(
             config.models.claude_bin,
             models={"fast": config.models.fast, "work": config.models.work, "think": config.models.think},
+            sandbox=config.models.sandbox,
         )
         self.usage = Usage()
         self.usage_day = ""
@@ -239,8 +282,8 @@ class Router:
             return self._queue(reason)
         try:
             text = self.claude.complete(prompt, tier, system)
-        except Exception:  # noqa: BLE001 - live inference must fail closed
-            reason = "claude invocation failed"
+        except Exception as exc:  # noqa: BLE001 - live inference must fail closed
+            reason = f"claude invocation failed: {str(exc)[:120]}"
             if self.config.models.allow_api_fallback:
                 reason += "; API fallback is not configured"
             return self._queue(reason)
@@ -268,8 +311,8 @@ class Router:
             return self._queue(reason)
         try:
             text = self.claude.complete_in_dir(prompt, cwd, work_root, tier=tier)
-        except Exception:  # noqa: BLE001 - live inference must fail closed
-            reason = "claude invocation failed"
+        except Exception as exc:  # noqa: BLE001 - live inference must fail closed
+            reason = f"claude invocation failed: {str(exc)[:120]}"
             if self.config.models.allow_api_fallback:
                 reason += "; API fallback is not configured"
             return self._queue(reason)

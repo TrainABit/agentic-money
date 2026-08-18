@@ -37,6 +37,10 @@ class ModelConfig(BaseModel):
     think: str = "opus"
     daily_token_budget: int = 400_000
     claude_bin: str = "claude"
+    # OS-level filesystem sandbox around jailed craft subprocesses:
+    # "off" keeps the CLI tool allowlist only; "auto" wraps with bubblewrap
+    # when it is installed; "bwrap" requires bubblewrap and fails closed.
+    sandbox: Literal["off", "auto", "bwrap"] = "auto"
 
 
 class SimConfig(BaseModel):
@@ -70,6 +74,7 @@ class LiveTiming(BaseModel):
     certification_failure_retry_minutes: float = 15.0
     craft_retry_hours: float = 1.0
     quorum_deadline_hours: float = 24.0
+    mail_poll_minutes: float = 5.0
 
 
 class EngineConfig(BaseModel):

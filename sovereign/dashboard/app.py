@@ -11,6 +11,7 @@ from typing import Any, TypeVar
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from sovereign import ops
 from sovereign.config import EngineConfig
 from sovereign.engine.world import World, bootstrap
 
@@ -33,6 +34,8 @@ HTML = """<!doctype html>
   pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; white-space: pre-wrap; max-height: 260px; overflow: auto; color: #c5d0dc; margin: 0; }
   .pills { display:flex; flex-wrap:wrap; gap:8px; }
   .pill { background:#1e2630; border-radius:999px; padding:4px 10px; font-size:12px; }
+  .pill.alert { background:#4a1d24; color:#ffb3bd; }
+  #dead-letters { margin:0; padding-left:18px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; color:#c5d0dc; max-height:160px; overflow:auto; }
   #observer-auth { display:flex; gap:8px; align-items:center; margin-top:8px; }
   #observer-auth[hidden] { display:none; }
   #observer-token { background:#0b0d10; border:1px solid #33404e; border-radius:6px; color:#e8edf2; padding:5px 8px; }
@@ -81,6 +84,14 @@ HTML = """<!doctype html>
   <section>
     <h2>Health / tools</h2>
     <pre id="health"></pre>
+  </section>
+  <section>
+    <h2>Runtime</h2>
+    <div class="pills" id="runtime"></div>
+    <h2>Recent agent errors</h2>
+    <pre id="agent-errors"></pre>
+    <h2>Dead letters</h2>
+    <ul id="dead-letters"></ul>
   </section>
   <section style="grid-column: 1 / -1">
     <h2>Recent events</h2>
@@ -156,9 +167,49 @@ function renderPipeline(status) {
   byId('pills').replaceChildren(fragment);
 }
 
+function renderRuntime(runtime) {
+  const ticks = runtime.ticks || {};
+  const fragment = document.createDocumentFragment();
+  fragment.appendChild(makePill('tick avg ' + numberOrZero(ticks.avg_ms).toFixed(1) + ' ms'));
+  fragment.appendChild(makePill('tick last ' + numberOrZero(ticks.last_ms).toFixed(1) + ' ms'));
+  for (const [name, count] of Object.entries(runtime.comms || {})) {
+    const pill = makePill('comms ' + String(name) + ' ' + String(count));
+    if (name === 'dead' && numberOrZero(count) > 0) pill.classList.add('alert');
+    fragment.appendChild(pill);
+  }
+  byId('runtime').replaceChildren(fragment);
+  const errors = (runtime.agents || {}).recent_errors || {};
+  byId('agent-errors').textContent = Object.keys(errors).length
+    ? JSON.stringify(errors, null, 2)
+    : 'none';
+}
+
+function renderDeadLetters(rows) {
+  const items = Array.isArray(rows) ? rows : [];
+  const fragment = document.createDocumentFragment();
+  if (!items.length) {
+    const none = document.createElement('li');
+    none.textContent = 'none';
+    fragment.appendChild(none);
+  }
+  for (const row of items) {
+    const item = document.createElement('li');
+    item.textContent = String(row.ts) + ' · ' + String(row.kind) + ' ' +
+      String(row.sender) + ' → ' + String(row.recipient) +
+      ' · attempts ' + String(row.attempts) +
+      (row.error ? ' · ' + String(row.error) : '');
+    fragment.appendChild(item);
+  }
+  byId('dead-letters').replaceChildren(fragment);
+}
+
 async function tick() {
   try {
-    const s = await fetchJson('/api/status');
+    const [s, runtime, deadLetters] = await Promise.all([
+      fetchJson('/api/status'),
+      fetchJson('/api/metrics'),
+      fetchJson('/api/comms?status=dead&limit=8'),
+    ]);
     const cognition = s.cognition || {};
     byId('firm').textContent = String(s.firm) + ' · ' + String(s.mode) + ' · tick ' + String(s.tick);
     byId('meta').textContent = String(cognition.provider) + ' · tokens ' + String(cognition.tokens);
@@ -173,6 +224,8 @@ async function tick() {
     const toolCount = (s.tools && s.tools.names) ? s.tools.names.length : 0;
     byId('health').textContent = JSON.stringify({health:s.health, tools: toolCount, skills:s.skills}, null, 2);
     byId('events').textContent = JSON.stringify((s.recent_events || []).slice(0,12), null, 2);
+    renderRuntime(runtime);
+    renderDeadLetters(deadLetters);
   } catch (error) {
     byId('meta').textContent = error instanceof Error ? error.message : 'Dashboard request failed';
   }
@@ -260,6 +313,19 @@ def create_app(data_dir: str, mode: str) -> FastAPI:
     @api.get("/health")
     def health() -> JSONResponse:
         return world_response(lambda w: w.store.get_kv("health") or {})
+
+    @api.get("/metrics")
+    def metrics() -> JSONResponse:
+        return world_response(ops.metrics)
+
+    @api.get("/comms")
+    def comms(status: str | None = None, limit: int = 50) -> JSONResponse:
+        try:
+            return world_response(
+                lambda w: ops.sanitized_messages(w, status=status or None, limit=limit)
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @api.get("/tools")
     def tools() -> JSONResponse:

@@ -11,6 +11,7 @@ from sovereign.config import EngineConfig
 from sovereign.engine.heartbeat import step
 from sovereign.engine.world import bootstrap
 from sovereign.log import setup_logging
+from sovereign.ops import readiness
 
 
 class FileLock:
@@ -44,8 +45,16 @@ class FileLock:
                 self.fd = None
 
 
-def serve(config: EngineConfig, ticks: int = 0, verbose: bool = False) -> None:
-    """Forever loop unless ticks>0. Crash-safe: state is in sqlite after each tick."""
+def serve(
+    config: EngineConfig, ticks: int = 0, verbose: bool = False, force: bool = False
+) -> None:
+    """Forever loop unless ticks>0. Crash-safe: state is in sqlite after each tick.
+
+    After bootstrap and a full heal, a readiness gate runs: in live mode a
+    failing required check refuses to serve (RuntimeError) unless ``force``
+    overrides it; sim mode (or force) only warns and continues. The file lock
+    is always released on the way out, including on a refused start.
+    """
     paths = config.paths()
     paths.ensure()
     log = setup_logging(paths.logs)
@@ -56,15 +65,28 @@ def serve(config: EngineConfig, ticks: int = 0, verbose: bool = False) -> None:
     def _stop(*_args: object) -> None:
         stop["flag"] = True
 
-    signal.signal(signal.SIGINT, _stop)
-    signal.signal(signal.SIGTERM, _stop)
-    world = bootstrap(config)
-    from sovereign.heal.repair import setup as heal_setup
-
-    heal_setup(world, full=True)
     n = 0
-    log.info("daemon start mode=%s pid=%s", config.mode, os.getpid())
     try:
+        signal.signal(signal.SIGINT, _stop)
+        signal.signal(signal.SIGTERM, _stop)
+        world = bootstrap(config)
+        from sovereign.heal.repair import setup as heal_setup
+
+        heal_setup(world, full=True)
+        report = readiness(world)
+        failing = [
+            check["name"]
+            for check in report["checks"]
+            if check["required"] and not check["ok"]
+        ]
+        if failing:
+            names = ", ".join(failing)
+            if config.mode == "live" and not force:
+                raise RuntimeError(
+                    f"live serve refused; failing required readiness checks: {names}"
+                )
+            log.warning("serving despite failing required readiness checks: %s", names)
+        log.info("daemon start mode=%s pid=%s", config.mode, os.getpid())
         while not stop["flag"]:
             try:
                 r = step(world)

@@ -4,7 +4,7 @@ import json
 import re
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Sequence
 
 from sovereign.engine.schedule import aware_utc, parse_datetime
@@ -15,6 +15,8 @@ STATUS_DONE = "done"
 STATUS_EXPIRED = "expired"
 STATUS_DEAD = "dead"
 STATUSES = frozenset({STATUS_QUEUED, STATUS_DONE, STATUS_EXPIRED, STATUS_DEAD})
+REQUEUEABLE_STATUSES = frozenset({STATUS_DEAD, STATUS_EXPIRED})
+PRUNABLE_STATUSES = frozenset({STATUS_DONE, STATUS_EXPIRED, STATUS_DEAD})
 
 KIND_RE = re.compile(r"^[a-z][a-z0-9_.]{0,63}$")
 KIND_MAX_LEN = 64
@@ -356,6 +358,71 @@ class Bus:
             },
             agent=record["recipient"],
         )
+
+    def requeue(self, message_id: str, *, now: datetime) -> Message:
+        """Give a dead or expired delivery another life as a fresh queued row.
+
+        Attempts reset to zero and the recorded error clears, so the row gets
+        its full retry budget again. Any other status is rejected: done rows
+        were handled and queued rows are already live.
+        """
+        _require_now(now)
+        with self.store.transaction():
+            record = self.store.get_message(message_id)
+            if record is None:
+                raise KeyError(message_id)
+            if record["status"] not in REQUEUEABLE_STATUSES:
+                raise ValueError(
+                    f"cannot requeue message in status {record['status']!r}; "
+                    "only dead or expired rows may be requeued"
+                )
+            record["status"] = STATUS_QUEUED
+            record["attempts"] = 0
+            record["error"] = None
+            self.store.update_message(record)
+            self.store.emit(
+                "comms_requeued",
+                {
+                    "id": record["id"],
+                    "kind": record["kind"],
+                    "recipient": record["recipient"],
+                },
+                agent=record["recipient"],
+            )
+            refreshed = self.store.get_message(message_id)
+        return Message.from_record(refreshed)
+
+    def prune(
+        self,
+        *,
+        now: datetime,
+        older_than_days: float = 14.0,
+        statuses: Sequence[str] = (STATUS_DONE, STATUS_EXPIRED),
+    ) -> int:
+        """Delete settled rows older than the horizon; queued rows are untouchable.
+
+        Only done, expired, and dead statuses may be pruned (dead requires an
+        explicit opt-in). Emits ``comms_pruned`` only when rows were removed.
+        """
+        now = _require_now(now)
+        chosen = tuple(dict.fromkeys(statuses))
+        if not chosen:
+            raise ValueError("statuses must not be empty")
+        invalid = [status for status in chosen if status not in PRUNABLE_STATUSES]
+        if invalid:
+            raise ValueError(
+                f"cannot prune statuses {invalid!r}; allowed: "
+                f"{', '.join(sorted(PRUNABLE_STATUSES))} (queued is never prunable)"
+            )
+        days = float(older_than_days)
+        if not days >= 0.0:  # also rejects NaN
+            raise ValueError("older_than_days must be >= 0")
+        cutoff = iso(now - timedelta(days=days))
+        with self.store.transaction():
+            count = self.store.delete_messages(chosen, cutoff)
+            if count > 0:
+                self.store.emit("comms_pruned", {"count": count, "statuses": list(chosen)})
+        return count
 
     def replies(self, correlation_id: str) -> list[Message]:
         rows = self.store.messages(correlation_id=correlation_id, limit=None)

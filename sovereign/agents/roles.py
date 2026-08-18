@@ -1106,6 +1106,12 @@ def improver(world: World) -> list[dict[str, Any]]:
 
 
 def courier(world: World) -> list[dict[str, Any]]:
+    from sovereign.channels.mail import agentmail_seen_ids, ingest_remote_inbound
+    from sovereign.channels.transports import (
+        agentmail_credentials,
+        build_agentmail_transport,
+    )
+
     if world.treasury.trading_book() > 0 and world.config.mode == "live":
         world.human.ask(
             "exchange",
@@ -1113,6 +1119,25 @@ def courier(world: World) -> list[dict[str, Any]]:
             ["EXCHANGE_API_KEY", "EXCHANGE_API_SECRET"],
             "Live execution. Paper runs without this.",
         )
+    agentmail_ready = agentmail_credentials(world) is not None
+    poll_report: dict[str, Any] | None = None
+    if (
+        world.config.mode == "live"
+        and agentmail_ready
+        and world.scheduler.claim(
+            "agentmail_poll",
+            now=world.now,
+            tick=world.tick,
+            sim_every_ticks=1,
+            live_every=timedelta(minutes=world.config.live_timing.mail_poll_minutes),
+        )
+    ):
+        try:
+            transport = build_agentmail_transport(world)
+            items = transport.poll(limit=25, seen_ids=set(agentmail_seen_ids(world)))
+            poll_report = {"polled": len(items), "ingested": ingest_remote_inbound(world, items)}
+        except Exception as exc:  # noqa: BLE001 - a provider outage must not freeze courier
+            poll_report = {"error": str(exc)[:200]}
     if world.config.mode == "live" and not world.wallet.get_credential("SMTP_HOST"):
         world.human.ask(
             "smtp",
@@ -1120,5 +1145,19 @@ def courier(world: World) -> list[dict[str, Any]]:
             ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "SMTP_FROM"],
             "Outbound email. File outbox already works.",
         )
+        if not agentmail_ready:
+            world.human.ask(
+                "agentmail",
+                "Optional AgentMail credentials (API key + inbox id) so email is actually sent and received. Create an inbox at agentmail.to.",
+                ["AGENTMAIL_API_KEY", "AGENTMAIL_INBOX_ID"],
+                "Real outbound/inbound email. The file outbox still works.",
+            )
     open_q = world.human.open()
-    return [{"kind": "courier", "open_human_requests": len(open_q), "ids": [i["id"] for i in open_q]}]
+    action: dict[str, Any] = {
+        "kind": "courier",
+        "open_human_requests": len(open_q),
+        "ids": [i["id"] for i in open_q],
+    }
+    if poll_report is not None:
+        action["agentmail"] = poll_report
+    return [action]

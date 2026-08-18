@@ -133,6 +133,43 @@ The heartbeat processes inboxes each tick: expired deadlines are swept and
 queued messages are handed to their recipients' handlers in agent order,
 acked on success, failed (and eventually dead-lettered) on error.
 
+**Operations.** `sovereign comms` lists sanitized message rows (payloads are
+never printed), `--requeue MSG_ID` returns a dead or expired row to the
+queue with reset attempts, and `--purge-days N` deletes old `done`/`expired`
+rows. The heartbeat also runs an automatic retention sweep (14-day horizon,
+daily in live, every 50 ticks in sim). `/api/metrics` and
+`/api/comms?status=dead` expose the same data read-only on the dashboard,
+and the weekly report written to `data/artifacts/reports/` summarizes comms
+health next to revenue, pipeline, incidents, and goal progress.
+
+## Mail transports
+
+Outbound mail resolves the first configured transport: **AgentMail**
+(vault credentials `AGENTMAIL_API_KEY` + `AGENTMAIL_INBOX_ID`; optional
+dependency installed via `pip install -e ".[mail]"`), then **SMTP**
+(`SMTP_HOST`/`SMTP_PORT`/`SMTP_USER`/`SMTP_PASS`/`SMTP_FROM`), then the
+**local file outbox** (`data/mail/outbox/`, also the durable queue when a
+remote transport fails — the message keeps its idempotency key and the send
+error). With AgentMail configured, the courier polls the inbox on the
+`live_timing.mail_poll_minutes` cadence, labels fetched messages
+`sovereign-processed`, deduplicates by message id, and writes each new
+message as an `am_<id>.json` drop-in. Drop-ins flow through the same
+`ingest_dropins` → `authorize_state_change` pipeline as file leads:
+an accept/reject only lands when the sender matches the job contact, a
+trusted sender, or a valid HMAC signature. Inbound bodies are untrusted
+data end to end.
+
+## Sandbox
+
+Live crafting already runs Claude jailed to the job directory with a tool
+allowlist. When bubblewrap is installed, the subprocess is additionally
+wrapped in an OS-level filesystem sandbox (`models.sandbox: auto`, the
+default): the entire filesystem is bind-mounted read-only, only the job's
+work directory and the CLI's own session state are writable, and `/tmp` is
+a private tmpfs. Network stays shared because the CLI must reach its model
+provider. `models.sandbox: bwrap` makes the sandbox mandatory and fails
+closed (the craft queues) when bubblewrap is missing; `off` disables it.
+
 ## Worked example: operator infra purchase quorum
 
 The operator wants a $6/month VPS (the standing plan in

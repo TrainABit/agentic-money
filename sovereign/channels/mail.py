@@ -8,11 +8,20 @@ import uuid
 from email.utils import parseaddr
 from typing import TYPE_CHECKING, Any
 
+from sovereign.channels.transports import (
+    MAX_BODY_CHARS,
+    OutboundResult,
+    resolve_outbound_transport,
+)
 from sovereign.fileio import atomic_write_text, file_lock
 from sovereign.security import validate_job_id
 
 if TYPE_CHECKING:
     from sovereign.engine.world import World
+
+
+AGENTMAIL_SEEN_KEY = "agentmail_seen_ids"
+_AGENTMAIL_SEEN_CAP = 500
 
 
 _ADDRESS_RE = re.compile(
@@ -101,8 +110,21 @@ def send(
         world.store.upsert_mail(msg)
         path = paths.mail_outbox / f"{msg['id']}.json"
         atomic_write_text(path, json.dumps(msg, indent=2), mode=0o600)
-        smtp_host = world.wallet.get_credential("SMTP_HOST")
-        if smtp_host:
+        transport_name, transport_send = resolve_outbound_transport(world)
+        if transport_name == "agentmail" and transport_send is not None:
+            try:
+                transport_send(msg["address"], msg["subject"], msg["body"])
+                outcome = OutboundResult(status="sent", transport="agentmail")
+            except Exception as exc:  # noqa: BLE001 - any provider failure must queue
+                outcome = OutboundResult(
+                    status="queued", transport="agentmail", error=str(exc)[:200]
+                )
+            msg["status"] = outcome.status
+            if outcome.error is None:
+                msg["transport"] = outcome.transport
+            else:
+                msg["send_error"] = outcome.error
+        elif transport_name == "smtp":
             try:
                 _smtp_send(world, msg)
                 msg["status"] = "sent"
@@ -155,6 +177,57 @@ def ingest_dropins(world: World) -> list[dict[str, Any]]:
             destination = world.config.paths().mail_sent / f"in_{uuid.uuid4().hex[:8]}_{p.name}"
         p.rename(destination)
     return ingested
+
+
+def agentmail_seen_ids(world: World) -> list[str]:
+    """Ids of remote messages already turned into drop-ins (FIFO, capped)."""
+    raw = world.store.get_kv(AGENTMAIL_SEEN_KEY) or []
+    if not isinstance(raw, list):
+        return []
+    return [str(item) for item in raw]
+
+
+def ingest_remote_inbound(world: World, items: list[dict[str, Any]]) -> int:
+    """Turn polled remote messages into inbox drop-ins, once per remote id.
+
+    The files land in paths.mail_inbox and are consumed by ingest_dropins on
+    the next tick, so every remote message goes through the same sender
+    authorization (authorize_state_change) as any other drop-in.
+    """
+    seen = agentmail_seen_ids(world)
+    seen_set = set(seen)
+    inbox = world.config.paths().mail_inbox
+    written = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        agentmail_id = str(item.get("agentmail_id") or "").strip()
+        if not agentmail_id or agentmail_id in seen_set:
+            continue
+        payload = {
+            "from": str(item.get("from") or ""),
+            "subject": str(item.get("subject") or ""),
+            "body": str(item.get("body") or "")[:MAX_BODY_CHARS],
+            "ts": str(item.get("ts") or world.stamp()),
+            "source": "agentmail",
+        }
+        path = inbox / _remote_dropin_name(agentmail_id)
+        atomic_write_text(path, json.dumps(payload, indent=2), mode=0o600)
+        seen.append(agentmail_id)
+        seen_set.add(agentmail_id)
+        written += 1
+    if written:
+        world.store.set_kv(AGENTMAIL_SEEN_KEY, seen[-_AGENTMAIL_SEEN_CAP:])
+    return written
+
+
+def _remote_dropin_name(agentmail_id: str) -> str:
+    """Filesystem-safe drop-in name; remote ids are untrusted input."""
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", agentmail_id)[:80]
+    if safe != agentmail_id or not safe:
+        digest = hashlib.sha256(agentmail_id.encode()).hexdigest()[:12]
+        safe = f"{safe}_{digest}" if safe else digest
+    return f"am_{safe}.json"
 
 
 def interpret(msg: dict[str, Any]) -> dict[str, str] | None:

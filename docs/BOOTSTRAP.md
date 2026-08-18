@@ -19,7 +19,20 @@ The engine does not wait for a bank.
 5. `sovereign dashboard` — observe only (health + tools included); the default
    loopback bind needs no token
 6. Fill `sovereign inbox` items when you can (`sovereign reply hr_0001 ok=1`, or `SMTP_PASS=-` and type the secret on stdin). Replies go into the encrypted vault; values are not kept in the inbox JSON.
-7. `sovereign serve --mode live` once Claude is logged in.
+7. Optional real email: `pip install -e ".[mail]"`, then reply to the courier's
+   `agentmail` request with `AGENTMAIL_API_KEY` and `AGENTMAIL_INBOX_ID`.
+   Outbound proposals/invoices then send through AgentMail and the courier
+   polls the inbox every `live_timing.mail_poll_minutes` (default 5), feeding
+   replies into the same authorized drop-in pipeline. SMTP credentials remain
+   the fallback; with neither, the file outbox still works.
+8. `sovereign serve --mode live` once Claude is logged in. The daemon runs the
+   readiness gate first and refuses an unready live start (`--force`
+   overrides after you have read the failing checks).
+9. Schedule `sovereign backup --out /path/outside/the/box` (and test restores
+   with `sovereign backup --verify`). The backup contains the online SQLite
+   snapshot, playbooks, invoices, artifacts, and `secrets.enc` — never
+   `data/master.key`, which you must store separately for the backup to be
+   decryptable.
 
 If something is broken (corrupt `human_inbox.json`, missing playbook, stale
 `engine.lock`, unbound tools), do not start from scratch: `sovereign setup`
