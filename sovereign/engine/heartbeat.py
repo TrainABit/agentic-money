@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import time
 import uuid
+from datetime import timedelta
 from typing import Any, Callable
 
 from sovereign.engine.world import World, ensure_certified, load_prices
@@ -9,12 +11,49 @@ from sovereign.plays import PLAYS, attention_map, play_roi
 
 AgentFn = Callable[[World], list[dict[str, Any]]]
 
+TICK_METRICS_KEY = "tick_metrics"
+TICK_METRICS_KEEP = 50
+
 
 def _mid() -> str:
     return "m_" + uuid.uuid4().hex[:10]
 
 
+def _record_tick_metrics(world: World, elapsed_ms: float, actions: int, errors: int) -> None:
+    ring = world.store.get_kv(TICK_METRICS_KEY)
+    if not isinstance(ring, list):
+        ring = []
+    ring.append(
+        {
+            "tick": world.tick,
+            "ms": round(elapsed_ms, 1),
+            "actions": actions,
+            "errors": errors,
+        }
+    )
+    world.store.set_kv(TICK_METRICS_KEY, ring[-TICK_METRICS_KEEP:])
+
+
+def _maybe_write_weekly_report(world: World) -> None:
+    due = world.scheduler.claim(
+        "weekly_report",
+        now=world.now,
+        tick=world.tick,
+        sim_every_ticks=7,
+        live_every=timedelta(hours=168),
+    )
+    if not due or world.tick <= 1:
+        return
+    from sovereign import ops
+
+    try:
+        ops.write_weekly_report(world)
+    except Exception as e:  # reporting must never crash a tick
+        world.store.emit("report_error", {"error": str(e)[:200]}, "bookkeeper")
+
+
 def step(world: World) -> dict[str, Any]:
+    started = time.monotonic()
     world.start_tick()
     load_prices(world)
     ensure_certified(world)
@@ -50,6 +89,7 @@ def step(world: World) -> dict[str, Any]:
         world.comms.expire_due(now=world.now)
 
     actions: list[dict[str, Any]] = []
+    error_count = 0
     from sovereign.agents import roles
     from sovereign.comms.handlers import process_inbox
 
@@ -84,6 +124,7 @@ def step(world: World) -> dict[str, Any]:
         try:
             produced = fn(world) or []
         except Exception as e:
+            error_count += 1
             world.store.emit("agent_error", {"error": str(e)}, name)
             world.reputation.slash(name, 5, f"exception: {e}")
             if world.reputation.should_freeze(name):
@@ -95,10 +136,15 @@ def step(world: World) -> dict[str, Any]:
 
     world.persist_kv()
     world.finish_tick()
+    elapsed_ms = (time.monotonic() - started) * 1000.0
+    _record_tick_metrics(world, elapsed_ms, len(actions), error_count)
+    _maybe_write_weekly_report(world)
     snap = world.ledger.snapshot(now=world.now)
     return {
         "tick": world.tick,
         "actions": len(actions),
+        "duration_ms": round(elapsed_ms, 1),
+        "errors": error_count,
         "equity": snap["equity_usd"],
         "revenue": snap["revenue_usd"],
         "trailing": snap["trailing_30d_usd"],
