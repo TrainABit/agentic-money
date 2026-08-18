@@ -126,6 +126,28 @@ Claude session state, with a private `/tmp`. Set `models.sandbox: bwrap`
 to make the sandbox mandatory (fails closed without bubblewrap) or `off`
 to disable.
 
+### Money-making integrations (MCP) and design
+
+The crafter ships **design deliverables** with no external service: a
+keyword-routed branch generates a deterministic brand kit (logo SVG, social
+card, a self-contained landing page, and a brand guide) that the
+`design_studio` play sells. Install nothing for this — it is offline and
+built in.
+
+Agents can also use **Model Context Protocol (MCP) servers** as new
+money-making tools. With the `[mcp]` extra and an opt-in
+(`mcp.enabled: true` in `data/config.yaml`), hunter/closer/crafter/publisher/
+scout/operator gain `mcp.list` and `mcp.call`, which route to operator-
+configured servers — image generation for richer design work, web
+search/research for briefs and lead-gen, code hosting for dev deliverables,
+payment rails, data/spreadsheets, and more. Every server declares
+`allow_agents`, an optional `allowed_tools` allowlist, and a per-tick call
+cap; server secrets come from the encrypted vault by reference and are never
+logged; results reach agents fenced as untrusted data; and the registry is
+lazy and closed at tick end. `sovereign mcp` lists configured servers and
+`sovereign mcp --probe` discovers their tools. The recommended catalog of
+money-making servers and config examples: [`docs/MCP.md`](docs/MCP.md).
+
 Live labor loop (no auto-pay):
 
 ```bash
