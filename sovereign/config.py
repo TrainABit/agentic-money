@@ -37,6 +37,10 @@ class ModelConfig(BaseModel):
     think: str = "opus"
     daily_token_budget: int = 400_000
     claude_bin: str = "claude"
+    # OS-level filesystem sandbox around jailed craft subprocesses:
+    # "off" keeps the CLI tool allowlist only; "auto" wraps with bubblewrap
+    # when it is installed; "bwrap" requires bubblewrap and fails closed.
+    sandbox: Literal["off", "auto", "bwrap"] = "auto"
 
 
 class SimConfig(BaseModel):

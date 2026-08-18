@@ -87,6 +87,14 @@ def step(world: World) -> dict[str, Any]:
 
     if world.comms is not None:
         world.comms.expire_due(now=world.now)
+        if world.scheduler.claim(
+            "comms_retention",
+            now=world.now,
+            tick=world.tick,
+            sim_every_ticks=50,
+            live_every=timedelta(hours=24),
+        ):
+            world.comms.prune(now=world.now, older_than_days=14.0)
 
     actions: list[dict[str, Any]] = []
     error_count = 0
