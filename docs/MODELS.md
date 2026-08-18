@@ -5,14 +5,20 @@ Current routing is mode-dependent:
 1. Sim mode uses the deterministic brain.
 2. Live mode uses **Claude Code CLI** (`claude -p`) when the configured
    provider is `claude_code` and its executable is available.
-3. If the provider or executable is unavailable, a Claude invocation fails,
+3. An **HTTP API provider** is available (`models.provider: "api"`, or as a
+   fallback when `models.allow_api_fallback: true` and the Claude CLI is
+   unavailable or errors). It supports Anthropic Messages (`api_style:
+   "anthropic"`, the default) and OpenAI-compatible (`api_style: "openai"`)
+   endpoints via `models.api_base_url`; the key is a vault reference
+   (`models.api_key_ref`, default `ANTHROPIC_API_KEY`), never a literal.
+   Real token usage from the API response is accounted against the budget.
+4. If no provider is available, a Claude invocation fails with fallback off,
    or the router is already degraded, live completions return an empty result
    and record degraded/queued state. They do not substitute simulated content.
 
-There is no Anthropic HTTP provider implementation. Despite its legacy name,
-`allow_api_fallback` does not enable one. When set, the recorded error makes
-the missing API fallback explicit, but ordinary and jailed completion behavior
-remains fail-closed.
+Jailed crafting (`complete_in_dir`) is Claude-only by design: the API
+provider is text-only and cannot run tools in a work directory, so jailed
+work fails closed to a queue rather than falling back to the API.
 
 ## Tiers
 
@@ -24,9 +30,10 @@ remains fail-closed.
 
 ## Budget
 
-`daily_token_budget` defaults to 400,000. The router stores an approximate
-character-based token count, not Claude subscription usage, and resets it on
-the first call of each UTC day. For ordinary `complete` calls it:
+`daily_token_budget` defaults to 400,000. The router uses real token usage
+from the HTTP API response when that provider serves a call, and otherwise
+stores an approximate character-based count (Claude CLI usage is not exposed);
+it resets on the first call of each UTC day. For ordinary `complete` calls it:
 
 - downgrades `think` to `work` after recorded usage exceeds 70% of the budget
 - estimates the next prompt before dispatch

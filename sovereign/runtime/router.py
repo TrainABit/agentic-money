@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from sovereign.config import EngineConfig, ModelTier
+import httpx
+
+from sovereign.config import EngineConfig, ModelConfig, ModelTier
+
+SecretResolver = Callable[[str], str | None]
 
 
 class Provider(Protocol):
@@ -58,6 +64,106 @@ class SimBrain:
 
     def name(self) -> str:
         return "sim-brain"
+
+
+class ApiProvider:
+    """Direct HTTP completion API (Anthropic Messages or OpenAI chat style).
+
+    Text-only: it cannot run tools, so jailed crafting never routes here. The
+    api key is resolved per call (vault resolver first, process env fallback),
+    never stored on the instance, and never included in error messages.
+    """
+
+    MAX_COMPLETION_TOKENS = 4096
+
+    def __init__(self, config: ModelConfig, secret_resolver: SecretResolver | None = None) -> None:
+        self.config = config
+        self.secret_resolver = secret_resolver
+
+    def _key(self) -> str:
+        ref = self.config.api_key_ref
+        if self.secret_resolver is not None:
+            try:
+                resolved = self.secret_resolver(ref)
+            except Exception:  # noqa: BLE001 - a broken vault must not crash status paths
+                resolved = None
+            if resolved:
+                return str(resolved)
+        return os.environ.get(ref) or ""
+
+    def available(self) -> bool:
+        return bool(self._key())
+
+    def name(self) -> str:
+        return f"api:{self.config.api_style}"
+
+    def _model(self, tier: ModelTier) -> str:
+        return {"fast": self.config.fast, "work": self.config.work, "think": self.config.think}[tier]
+
+    def complete(self, prompt: str, tier: ModelTier, system: str) -> str:
+        return self.complete_with_usage(prompt, tier, system)[0]
+
+    def complete_with_usage(self, prompt: str, tier: ModelTier, system: str) -> tuple[str, int | None]:
+        """Return (text, real total tokens) — tokens is None when usage is absent."""
+        key = self._key()
+        if not key:
+            raise RuntimeError(f"no api key resolvable for ref {self.config.api_key_ref!r}")
+        if self.config.api_style == "anthropic":
+            headers = {
+                "x-api-key": key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            }
+            body: dict[str, Any] = {
+                "model": self._model(tier),
+                "max_tokens": self.MAX_COMPLETION_TOKENS,
+                "system": system,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+        else:
+            headers = {
+                "authorization": f"Bearer {key}",
+                "content-type": "application/json",
+            }
+            body = {
+                "model": self._model(tier),
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+            }
+        try:
+            response = httpx.post(
+                self.config.api_base_url,
+                json=body,
+                headers=headers,
+                timeout=self.config.api_timeout_s,
+            )
+        except httpx.HTTPError as exc:
+            # `from None`: httpx exceptions reference the request (and its headers).
+            raise RuntimeError(f"api request failed: {type(exc).__name__}") from None
+        if response.status_code != 200:
+            raise RuntimeError(f"api returned HTTP {response.status_code}")
+        try:
+            data = response.json()
+            if self.config.api_style == "anthropic":
+                text = str(data["content"][0]["text"])
+            else:
+                text = str(data["choices"][0]["message"]["content"])
+        except Exception:  # noqa: BLE001 - response bodies must never leak into errors
+            raise RuntimeError("api response body was malformed") from None
+        return text, self._usage_total(data)
+
+    def _usage_total(self, data: Any) -> int | None:
+        try:
+            usage = data.get("usage") or {}
+            if self.config.api_style == "anthropic":
+                total = int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0)
+            else:
+                total = int(usage.get("total_tokens") or 0)
+        except Exception:  # noqa: BLE001 - usage is best-effort; the text is the contract
+            return None
+        return total if total > 0 else None
 
 
 def jail_contains(child: Path, root: Path) -> bool:
@@ -216,7 +322,7 @@ class ClaudeCodeProvider:
 
 
 class Router:
-    def __init__(self, config: EngineConfig) -> None:
+    def __init__(self, config: EngineConfig, secret_resolver: SecretResolver | None = None) -> None:
         self.config = config
         self.sim = SimBrain()
         self.claude = ClaudeCodeProvider(
@@ -224,6 +330,7 @@ class Router:
             models={"fast": config.models.fast, "work": config.models.work, "think": config.models.think},
             sandbox=config.models.sandbox,
         )
+        self.api = ApiProvider(config.models, secret_resolver)
         self.usage = Usage()
         self.usage_day = ""
         self.degraded = False
@@ -231,12 +338,15 @@ class Router:
         self.last_error: str | None = None
 
     def provider_name(self) -> str:
-        if self.degraded:
-            return "degraded"
         if self.config.mode == "sim":
             return self.sim.name()
-        if self.config.models.provider == "claude_code" and self.claude.available():
+        models = self.config.models
+        if models.provider == "api" and self.api.available():
+            return self.api.name()
+        if models.provider == "claude_code" and self.claude.available():
             return self.claude.name()
+        if self.degraded:
+            return "degraded"
         return "unavailable"
 
     def _roll_day(self) -> None:
@@ -273,22 +383,41 @@ class Router:
             return text
         if self.degraded:
             return self._queue(self.last_error or "model provider unavailable")
-        if self.config.models.provider != "claude_code":
-            return self._queue(f"model provider {self.config.models.provider!r} is unavailable")
+        models = self.config.models
+        if models.provider == "api":
+            if not self.api.available():
+                return self._queue(f"api key {models.api_key_ref!r} is not resolvable")
+            return self._api_complete(prompt, tier, system, est)
+        if models.provider != "claude_code":
+            return self._queue(f"model provider {models.provider!r} is unavailable")
         if not self.claude.available():
-            reason = "claude CLI unavailable"
-            if self.config.models.allow_api_fallback:
-                reason += "; API fallback is not configured"
-            return self._queue(reason)
+            return self._claude_fallback(prompt, tier, system, est, "claude CLI unavailable")
         try:
             text = self.claude.complete(prompt, tier, system)
         except Exception as exc:  # noqa: BLE001 - live inference must fail closed
-            reason = f"claude invocation failed: {str(exc)[:120]}"
-            if self.config.models.allow_api_fallback:
-                reason += "; API fallback is not configured"
-            return self._queue(reason)
+            return self._claude_fallback(
+                prompt, tier, system, est, f"claude invocation failed: {str(exc)[:120]}"
+            )
         self._count(tier, est + len(text) // 4)
         return text
+
+    def _api_complete(self, prompt: str, tier: ModelTier, system: str, est: int) -> str:
+        try:
+            text, real_tokens = self.api.complete_with_usage(prompt, tier, system)
+        except Exception as exc:  # noqa: BLE001 - live inference must fail closed
+            return self._queue(f"api invocation failed: {str(exc)[:120]}")
+        self._count(tier, real_tokens if real_tokens is not None else est + len(text) // 4)
+        return text
+
+    def _claude_fallback(self, prompt: str, tier: ModelTier, system: str, est: int, reason: str) -> str:
+        models = self.config.models
+        if models.allow_api_fallback and self.api.available():
+            return self._api_complete(prompt, tier, system, est)
+        if models.allow_api_fallback:
+            reason += "; API fallback is not configured"
+        else:
+            reason += "; API fallback disabled"
+        return self._queue(reason)
 
     def complete_in_dir(self, prompt: str, cwd: Path, work_root: Path, tier: ModelTier = "work") -> str:
         if not jail_contains(Path(cwd), Path(work_root)):
@@ -302,19 +431,24 @@ class Router:
             return self._queue("daily model budget exhausted")
         if self.degraded:
             return self._queue(self.last_error or "model provider unavailable")
+        # Jailed crafting needs a tool-running provider; the HTTP API is
+        # text-only, so this path is claude_code-only and never falls back.
         if self.config.models.provider != "claude_code":
-            return self._queue(f"model provider {self.config.models.provider!r} is unavailable")
+            return self._queue(
+                f"model provider {self.config.models.provider!r} cannot run jailed crafting; "
+                "claude_code required"
+            )
         if not self.claude.available():
             reason = "claude CLI unavailable"
             if self.config.models.allow_api_fallback:
-                reason += "; API fallback is not configured"
+                reason += "; API fallback cannot run jailed crafting"
             return self._queue(reason)
         try:
             text = self.claude.complete_in_dir(prompt, cwd, work_root, tier=tier)
         except Exception as exc:  # noqa: BLE001 - live inference must fail closed
             reason = f"claude invocation failed: {str(exc)[:120]}"
             if self.config.models.allow_api_fallback:
-                reason += "; API fallback is not configured"
+                reason += "; API fallback cannot run jailed crafting"
             return self._queue(reason)
         self._count(tier, estimate + len(text) // 4)
         return text
@@ -341,6 +475,7 @@ class Router:
             "by_tier": self.usage.by_tier,
             "budget": self.config.models.daily_token_budget,
             "claude_cli": self.claude.available(),
+            "api_configured": self.api.available(),
             "usage_day": self.usage_day,
             "degraded": self.degraded,
             "queued": self.queued,
