@@ -283,6 +283,17 @@ class Store:
                   use_count INTEGER NOT NULL DEFAULT 0,
                   last_used_ts TEXT
                 );
+                CREATE TABLE IF NOT EXISTS chain_txids (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  ts TEXT NOT NULL,
+                  chain TEXT NOT NULL,
+                  txid TEXT NOT NULL,
+                  amount_minor INTEGER NOT NULL,
+                  sender TEXT,
+                  invoice_id TEXT,
+                  UNIQUE(chain, txid)
+                );
+                CREATE INDEX IF NOT EXISTS idx_chain_txids_chain_txid ON chain_txids(chain, txid);
                 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
                 CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status);
                 CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);
@@ -558,6 +569,60 @@ class Store:
                 (job_id,),
             ).fetchone()
         return json.loads(row["payload"]) if row else None
+
+    def record_chain_txid(
+        self,
+        chain: str,
+        txid: str,
+        amount_minor: int,
+        sender: str | None = None,
+        invoice_id: str | None = None,
+        ts: str | None = None,
+    ) -> bool:
+        """Record one observed on-chain transfer; True only when newly inserted.
+
+        UNIQUE(chain, txid) with INSERT OR IGNORE is the settlement dedup
+        primitive: the first recorder wins, and every later observation of
+        the same transfer returns False.
+        """
+        with self._lock:
+            try:
+                cursor = self.conn.execute(
+                    """
+                    INSERT OR IGNORE INTO chain_txids(
+                      ts, chain, txid, amount_minor, sender, invoice_id
+                    )
+                    VALUES (?,?,?,?,?,?)
+                    """,
+                    (ts or iso(), chain, txid, int(amount_minor), sender, invoice_id),
+                )
+                if self._transaction_depth() == 0:
+                    self.conn.commit()
+            except BaseException:
+                if self._transaction_depth() == 0:
+                    self.conn.rollback()
+                raise
+        return int(cursor.rowcount) > 0
+
+    def chain_txid_seen(self, chain: str, txid: str) -> bool:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT 1 FROM chain_txids WHERE chain=? AND txid=?",
+                (chain, txid),
+            ).fetchone()
+        return row is not None
+
+    def chain_txids(self, chain: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+        query = "SELECT id, ts, chain, txid, amount_minor, sender, invoice_id FROM chain_txids"
+        args: list[Any] = []
+        if chain:
+            query += " WHERE chain=?"
+            args.append(chain)
+        query += " ORDER BY id DESC LIMIT ?"
+        args.append(int(limit))
+        with self._lock:
+            rows = self.conn.execute(query, args).fetchall()
+        return [dict(r) for r in rows]
 
     def upsert_mail(self, msg: dict[str, Any]) -> None:
         self._execute_write(

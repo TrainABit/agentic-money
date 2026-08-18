@@ -388,7 +388,7 @@ def bootstrap(config: EngineConfig, *, heal: bool = True, clock: Clock | None = 
             "mechanic",
         )
         store.set_kv("legacy_sol_wallet_notified", True)
-    router = Router(config)
+    router = Router(config, secret_resolver=wallet.get_credential)
     world = World(
         config=config,
         store=store,

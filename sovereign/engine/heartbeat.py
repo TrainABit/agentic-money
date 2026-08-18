@@ -6,6 +6,7 @@ import uuid
 from datetime import timedelta
 from typing import Any, Callable
 
+from sovereign.engine.watchdog import AgentTimeout, run_with_timeout
 from sovereign.engine.world import World, ensure_certified, load_prices
 from sovereign.plays import PLAYS, attention_map, play_roi
 
@@ -157,6 +158,26 @@ def step(world: World) -> dict[str, Any]:
     # One aggregate query decides whose inbox gets pumped this tick; agents
     # with nothing queued skip process_inbox entirely.
     queued = world.store.queued_recipient_counts() if world.comms is not None else {}
+    timeout_s = world.config.agent_timeout_seconds
+
+    def pump_inbox(agent: str) -> None:
+        """Timeout-guarded inbox pump: a wedged handler is abandoned with a
+        "comms_timeout" event instead of hanging the tick."""
+        nonlocal comms_ms, comms_processed
+        comms_started = time.monotonic()
+        try:
+            summaries = run_with_timeout(
+                lambda: process_inbox(world, agent), seconds=timeout_s, agent=agent
+            )
+        except AgentTimeout:
+            comms_ms += (time.monotonic() - comms_started) * 1000.0
+            world.store.emit("comms_timeout", {"agent": agent}, agent)
+            return
+        comms_ms += (time.monotonic() - comms_started) * 1000.0
+        comms_processed += len(summaries)
+        if summaries:
+            # Summaries carry ids/kinds/statuses only, never payload contents.
+            world.store.emit("comms", {"count": len(summaries), "results": summaries}, agent)
 
     pipeline = [
         roles.mechanic,
@@ -182,16 +203,27 @@ def step(world: World) -> dict[str, Any]:
             world.store.emit("skipped_frozen", {"agent": name}, name)
             continue
         if world.comms is not None and queued.get(name, 0) > 0:
-            comms_started = time.monotonic()
-            summaries = process_inbox(world, name)
-            comms_ms += (time.monotonic() - comms_started) * 1000.0
-            comms_processed += len(summaries)
-            if summaries:
-                # Summaries carry ids/kinds/statuses only, never payload contents.
-                world.store.emit("comms", {"count": len(summaries), "results": summaries}, name)
+            pump_inbox(name)
         agent_started = time.monotonic()
         try:
-            produced = fn(world) or []
+            # fn is bound as a lambda default so an abandoned worker that has
+            # not started yet can never late-bind to a later role in this loop.
+            produced = run_with_timeout(
+                lambda fn=fn: fn(world), seconds=timeout_s, agent=name
+            ) or []
+        except AgentTimeout:
+            # The wedged worker is abandoned (see watchdog docstring); the
+            # tick moves on. Elapsed is recorded as the full budget.
+            budget_ms = timeout_s * 1000.0
+            agent_ms[name] = agent_ms.get(name, 0.0) + budget_ms
+            error_count += 1
+            world.store.emit("agent_timeout", {"agent": name, "seconds": timeout_s}, name)
+            if tracing:
+                trace.record_agent(name, budget_ms, 0, error=f"timeout after {timeout_s:g}s")
+            world.reputation.slash(name, 3, f"timeout after {timeout_s:g}s")
+            if world.reputation.should_freeze(name):
+                world.freeze(name, f"timeout after {timeout_s:g}s", kind="runtime")
+            continue
         except Exception as e:
             role_ms = (time.monotonic() - agent_started) * 1000.0
             agent_ms[name] = agent_ms.get(name, 0.0) + role_ms
@@ -234,12 +266,7 @@ def step(world: World) -> dict[str, Any]:
             and queued.get(fn.__name__, 0) == 0
         ]
         for name in late:
-            comms_started = time.monotonic()
-            summaries = process_inbox(world, name)
-            comms_ms += (time.monotonic() - comms_started) * 1000.0
-            comms_processed += len(summaries)
-            if summaries:
-                world.store.emit("comms", {"count": len(summaries), "results": summaries}, name)
+            pump_inbox(name)
         if late:
             queued_after = world.store.queued_recipient_counts()
 

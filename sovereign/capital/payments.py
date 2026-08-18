@@ -5,6 +5,7 @@ from typing import Any, Callable
 
 import httpx
 
+from sovereign.capital import onchain
 from sovereign.memory.store import iso, usdc_amount, usdc_minor
 
 
@@ -583,10 +584,179 @@ def _match_suspense(
     return collected
 
 
+def _fetch_incoming_transfers(
+    world: Any,
+) -> tuple[list[onchain.IncomingTransfer], bool, list[str]]:
+    """Pull inbound transfer evidence from every chain that can serve it.
+
+    Each chain is independent: one that errors contributes a pay_watch_error
+    message and is treated as having no logs, exactly like the balance path.
+    """
+    pub = world.wallet.public()
+    chain_cfg = world.config.chain
+    transfers: list[onchain.IncomingTransfer] = []
+    errors: list[str] = []
+    fetched = False
+    try:
+        transfers.extend(
+            onchain.eth_incoming_usdc(
+                world.config.rpc_url,
+                world.config.usdc_token,
+                pub["eth_address"],
+                lookback_blocks=int(chain_cfg.eth_lookback_blocks),
+                confirmations=int(chain_cfg.eth_confirmations),
+            )
+        )
+        fetched = True
+    except Exception as e:
+        errors.append(f"eth: {str(e)[:160]}")
+    try:
+        transfers.extend(
+            onchain.sol_incoming_usdc(
+                world.config.sol_rpc_url,
+                pub["sol_address"],
+                world.config.sol_usdc_mint,
+                limit=int(chain_cfg.sol_lookback_sigs),
+            )
+        )
+        fetched = True
+    except Exception as e:
+        errors.append(f"sol: {str(e)[:160]}")
+    return transfers, fetched, errors
+
+
+def _settle_transfer(
+    world: Any,
+    state: dict[str, Any],
+    transfer: onchain.IncomingTransfer,
+    invoice_id: str,
+    observed_ts: str,
+) -> dict[str, Any]:
+    from sovereign.capital.invoice import collect
+
+    settled = collect(world, invoice_id, source=f"chain:{transfer.chain}")
+    if settled.get("status") != "paid":
+        return settled
+    # Log settlements bypass the balance ledger, so consume any suspense
+    # already holding this inflow and reserve the remainder; a later
+    # balance-path delta then reconciles the reservation instead of
+    # double-attributing the same funds.
+    consumed = _consume_any_suspense(state, transfer.amount_minor)
+    state["manual_reserved_minor"] = (
+        int(state["manual_reserved_minor"]) + transfer.amount_minor - consumed
+    )
+    state["auto_attributed_minor"] = (
+        int(state["auto_attributed_minor"]) + transfer.amount_minor
+    )
+    world.store.record_chain_txid(
+        transfer.chain,
+        transfer.txid,
+        transfer.amount_minor,
+        transfer.sender,
+        settled["id"],
+        observed_ts,
+    )
+    return settled
+
+
+def _collect_from_tx_logs(world: Any) -> tuple[list[dict[str, Any]], bool]:
+    """Settle open invoices from actual inbound transfers, deduped by txid.
+
+    Returns (collected, used_logs). used_logs is True only when at least one
+    chain's log fetch succeeded and produced transfer evidence; a fetch that
+    errors or comes back empty leaves the balance/suspense reconciliation in
+    charge, so RPCs without reliable log support (and quiet windows) keep the
+    exact legacy behavior.
+    """
+    transfers, fetched, errors = _fetch_incoming_transfers(world)
+    used_logs = fetched and bool(transfers)
+    with world.store.transaction():
+        if errors:
+            world.store.emit(
+                "pay_watch_error",
+                {"error": " | ".join(errors)[:240]},
+                "treasurer",
+            )
+        if not used_logs:
+            return [], False
+        state = _load_state(world)
+        observed_ts = iso()
+        collected: list[dict[str, Any]] = []
+        for transfer in transfers:
+            if world.store.chain_txid_seen(transfer.chain, transfer.txid):
+                continue
+            candidates = [
+                inv
+                for inv in world.store.invoices("open")
+                if usdc_minor(inv["amount"]) == transfer.amount_minor
+            ]
+            if len(candidates) > 1 and transfer.memo:
+                memo_hits = [
+                    inv
+                    for inv in candidates
+                    if inv.get("memo") and str(inv["memo"]) in transfer.memo
+                ]
+                if len(memo_hits) == 1:
+                    candidates = memo_hits
+            if len(candidates) == 1:
+                settled = _settle_transfer(
+                    world,
+                    state,
+                    transfer,
+                    candidates[0]["id"],
+                    observed_ts,
+                )
+                if settled.get("status") == "paid":
+                    collected.append(settled)
+                    continue
+            world.store.record_chain_txid(
+                transfer.chain,
+                transfer.txid,
+                transfer.amount_minor,
+                transfer.sender,
+                None,
+                observed_ts,
+            )
+            if len(candidates) > 1:
+                world.store.emit(
+                    "pay_ambiguous",
+                    {
+                        "chain": transfer.chain,
+                        "txid": transfer.txid,
+                        "usd": usdc_amount(transfer.amount_minor),
+                        "invoice_ids": [inv["id"] for inv in candidates],
+                    },
+                    "treasurer",
+                )
+            else:
+                world.store.emit(
+                    "pay_unattributed",
+                    {
+                        "chain": transfer.chain,
+                        "txid": transfer.txid,
+                        "usd": usdc_amount(transfer.amount_minor),
+                        "reason": "no_exact_invoice",
+                    },
+                    "treasurer",
+                )
+        _persist_state(world, state)
+        return collected, True
+
+
 def watch_and_collect(world: Any) -> list[dict[str, Any]]:
-    """Attribute only fresh, exact per-chain USDC balance deltas."""
+    """Attribute inbound USDC: transfer logs first, balance deltas as fallback.
+
+    When configured, actual on-chain transfer logs are the primary settlement
+    source (matched by exact amount, deduped by txid). Whenever no chain can
+    produce log evidence, the original fresh, exact per-chain balance-delta
+    reconciliation below runs unchanged.
+    """
     if world.config.mode != "live":
         return []
+    if world.config.chain.use_tx_logs:
+        collected, used_logs = _collect_from_tx_logs(world)
+        if used_logs:
+            return collected
     pub = world.wallet.public()
     errors: list[str] = []
     eth, err = _chain_balance(

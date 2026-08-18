@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from sovereign.alerts import AlertManager
 from sovereign.config import EngineConfig
 from sovereign.engine.heartbeat import step
 from sovereign.engine.world import bootstrap
@@ -87,6 +88,7 @@ def serve(
                 )
             log.warning("serving despite failing required readiness checks: %s", names)
         log.info("daemon start mode=%s pid=%s", config.mode, os.getpid())
+        alert_manager = AlertManager(config.alerts)
         idle_state: bool | None = None  # None until the first successful tick
         while not stop["flag"]:
             try:
@@ -112,6 +114,13 @@ def serve(
                 r.get("trailing", 0),
                 r["frozen"],
             )
+            # Out-of-band incident push after every successful tick. dispatch
+            # already swallows its own failures; the belt-and-braces except
+            # guarantees alerting can never break the serve loop.
+            try:
+                alert_manager.dispatch(world)
+            except Exception:
+                log.exception("alert dispatch failed")
             if verbose:
                 print(
                     f"tick={r['tick']} equity={r['equity']:.2f} "
