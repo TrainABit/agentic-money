@@ -10,6 +10,7 @@ from pathlib import Path
 import yaml
 
 from sovereign.agents.spec import AGENT_SPECS, spec_for
+from sovereign.comms.bus import STATUSES as COMMS_STATUSES
 from sovereign.config import EngineConfig
 from sovereign.engine.heartbeat import step
 from sovereign.engine.world import bootstrap, load_prices
@@ -270,7 +271,57 @@ def cmd_wallet(args: argparse.Namespace) -> int:
 def cmd_serve(args: argparse.Namespace) -> int:
     from sovereign.engine.daemon import serve
 
-    serve(_config(args), ticks=args.ticks, verbose=True)
+    serve(_config(args), ticks=args.ticks, verbose=True, force=args.force)
+    return 0
+
+
+def cmd_backup(args: argparse.Namespace) -> int:
+    from sovereign.backup import create_backup, verify_backup
+
+    if args.out and args.verify:
+        raise ValueError("--out and --verify are mutually exclusive; pass exactly one")
+    if args.verify:
+        report = verify_backup(Path(args.verify))
+        print(json.dumps(report, indent=2, default=str))
+        return 0 if report["ok"] else 1
+    if not args.out:
+        raise ValueError("backup needs --out DIR to create one or --verify DIR to check one")
+    manifest = create_backup(
+        _config(args), Path(args.out), include_secrets=not args.no_secrets
+    )
+    print(json.dumps(manifest, indent=2, default=str))
+    return 0
+
+
+_COMMS_FIELDS = ("id", "ts", "kind", "sender", "recipient", "status", "attempts", "error")
+
+
+def _comms_row(record: dict[str, object]) -> dict[str, object]:
+    """Payload-free projection of one messages row for operator output."""
+    return {field: record.get(field) for field in _COMMS_FIELDS}
+
+
+def cmd_comms(args: argparse.Namespace) -> int:
+    world = bootstrap(_config(args))
+    bus = world.comms
+    if args.requeue:
+        message = bus.requeue(args.requeue, now=world.now)
+        print(json.dumps(_comms_row(message.to_record()), indent=2, default=str))
+        return 0
+    if args.purge_days is not None:
+        pruned = bus.prune(now=world.now, older_than_days=args.purge_days)
+        print(json.dumps({"pruned": pruned}, indent=2))
+        return 0
+    if args.status is not None and args.status not in COMMS_STATUSES:
+        raise ValueError(
+            f"unknown status {args.status!r}; expected one of "
+            f"{', '.join(sorted(COMMS_STATUSES))}"
+        )
+    if args.limit <= 0:
+        raise ValueError("--limit must be a positive integer")
+    rows = world.store.messages(status=args.status, limit=None)
+    newest_first = list(reversed(rows))[: args.limit]
+    print(json.dumps([_comms_row(row) for row in newest_first], indent=2, default=str))
     return 0
 
 
@@ -395,7 +446,42 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("serve", help="Daemon loop with file lock")
     _globals(s)
     s.add_argument("--ticks", type=int, default=0, help="0 = forever")
+    s.add_argument(
+        "--force",
+        action="store_true",
+        help="Start even when required readiness checks fail (live gate override)",
+    )
     s.set_defaults(func=cmd_serve)
+
+    s = sub.add_parser(
+        "backup",
+        help="Snapshot db/docs into an empty dir (never master.key), or verify one",
+    )
+    _globals(s)
+    s.add_argument("--out", default=None, metavar="DIR", help="Create a backup in this empty directory")
+    s.add_argument(
+        "--verify", default=None, metavar="DIR", help="Verify a backup directory against its manifest"
+    )
+    s.add_argument("--no-secrets", action="store_true", help="Leave secrets.enc out of the backup")
+    s.set_defaults(func=cmd_backup)
+
+    s = sub.add_parser(
+        "comms", help="List, requeue, or prune agent messages (payloads stay hidden)"
+    )
+    _globals(s)
+    s.add_argument("--status", default=None, help="Filter the list by status (queued/done/expired/dead)")
+    s.add_argument("--limit", type=int, default=20, help="Max rows to list, newest first")
+    s.add_argument(
+        "--requeue", default=None, metavar="MSG_ID", help="Requeue one dead or expired message"
+    )
+    s.add_argument(
+        "--purge-days",
+        type=float,
+        default=None,
+        metavar="D",
+        help="Delete done/expired rows older than D days",
+    )
+    s.set_defaults(func=cmd_comms)
 
     s = sub.add_parser("accept", help="Mark a job accepted (live inbound)")
     _globals(s)

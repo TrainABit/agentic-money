@@ -581,6 +581,33 @@ class Store:
             ).fetchall()
         return {r["status"]: int(r["n"]) for r in rows}
 
+    def delete_messages(self, status_in: Sequence[str], older_than_ts: str) -> int:
+        """Delete messages in the given statuses whose ts sorts before the cutoff.
+
+        ``older_than_ts`` is an ISO-8601 UTC string; every persisted ts shares
+        that format, so lexicographic comparison matches chronological order
+        (the same convention ``ledger_rows`` relies on). Returns the number of
+        rows removed. Status policy (e.g. never deleting queued rows) is the
+        caller's responsibility.
+        """
+        statuses = tuple(status_in)
+        if not statuses:
+            return 0
+        placeholders = ",".join("?" for _ in statuses)
+        with self._lock:
+            try:
+                cursor = self.conn.execute(
+                    f"DELETE FROM messages WHERE status IN ({placeholders}) AND ts < ?",
+                    (*statuses, older_than_ts),
+                )
+                if self._transaction_depth() == 0:
+                    self.conn.commit()
+            except BaseException:
+                if self._transaction_depth() == 0:
+                    self.conn.rollback()
+                raise
+        return int(cursor.rowcount)
+
     def upsert_offer(self, offer: dict[str, Any]) -> None:
         record = dict(offer)
         record["price_usd"] = usd_amount(record.get("price_usd", 0))
