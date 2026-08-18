@@ -54,6 +54,15 @@ class SimConfig(BaseModel):
     daily_apply_cap: int = 8
 
 
+class DebugConfig(BaseModel):
+    """Tracing and slow-call thresholds for the debug instrumentation."""
+
+    enabled: bool = False
+    slow_tool_ms: float = 250.0
+    trace_retention_files: int = 200
+    include_tracebacks: bool = True
+
+
 class LiveTiming(BaseModel):
     """Wall-clock lifecycle limits and bounded live cadences."""
 
@@ -81,7 +90,10 @@ class EngineConfig(BaseModel):
     mode: Mode = "sim"
     data_dir: Path = Field(default_factory=lambda: Path("data"))
     tick_seconds: float = 15.0
+    # Live-mode sleep between ticks when the engine reports no active work.
+    idle_tick_seconds: float = 60.0
     tick_hours: float = 24.0
+    debug: DebugConfig = Field(default_factory=DebugConfig)
     goals: Goals = Field(default_factory=Goals)
     risk: RiskLimits = Field(default_factory=RiskLimits)
     models: ModelConfig = Field(default_factory=ModelConfig)

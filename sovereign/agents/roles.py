@@ -13,9 +13,24 @@ from sovereign.engine.heartbeat import fund_missions, playbook
 from sovereign.engine.schedule import elapsed_days, parse_datetime
 from sovereign.engine.world import World
 from sovereign.labor.boards import proposal_text, sim_client_accepts
-from sovereign.labor.pipeline import accept_job, reject_job
+from sovereign.labor.pipeline import accept_job, reject_job, won_lost_lesson
 from sovereign.markets.strategies import STRATEGIES
 from sovereign.plays import PLAYS, attention_map, play_roi
+
+
+def _remember_lesson(world: World, caller: str, topic: str, content: str) -> dict[str, Any] | None:
+    """Best-effort knowledge write through the tool registry.
+
+    Returns error info (for the caller's action dict) instead of raising so a
+    memory failure can never break a role. Skipped entirely when the world has
+    no knowledge base wired.
+    """
+    if getattr(world, "knowledge", None) is None:
+        return None
+    result = world.use_tool(caller, "knowledge.remember", topic=topic, content=content[:200])
+    if result.ok:
+        return None
+    return {"operation": "knowledge.remember", "topic": topic, "error": result.error}
 
 
 def mechanic(world: World) -> list[dict[str, Any]]:
@@ -34,21 +49,42 @@ def mechanic(world: World) -> list[dict[str, Any]]:
     )
     report = world.use_tool("mechanic", "heal.repair", full=full)
     data = report.data if report.ok else {"error": report.error}
+    # Transition-only health messaging: exactly one broadcast when the engine
+    # goes healthy->unhealthy and exactly one director notify on recovery,
+    # tracked across ticks in kv "health_alert_state". Steady states are silent.
+    health_transition = None
+    recovery_error = None
     if (
-        full
-        and report.ok
+        report.ok
         and isinstance(data, dict)
-        and data.get("healthy") is False
+        and isinstance(data.get("healthy"), bool)
         and world.comms is not None
-        and world.store.get_kv("health_alert_tick") != world.tick
     ):
-        world.comms.broadcast(
-            "mechanic",
-            "notify",
-            {"event": "health_alert", "healthy": False, "tick": world.tick},
-            now=world.now,
-        )
-        world.store.set_kv("health_alert_tick", world.tick)
+        healthy = data["healthy"]
+        state = world.store.get_kv("health_alert_state") or {}
+        was_healthy = bool(state.get("healthy", True))
+        if "healthy" not in state or healthy != was_healthy:
+            world.store.set_kv(
+                "health_alert_state", {"healthy": healthy, "tick": world.tick}
+            )
+        if was_healthy and not healthy:
+            world.comms.broadcast(
+                "mechanic",
+                "notify",
+                {"event": "health_alert", "healthy": False, "tick": world.tick},
+                now=world.now,
+            )
+            health_transition = "alerted"
+        elif not was_healthy and healthy:
+            health_transition = "recovered"
+            recovered = world.use_tool(
+                "mechanic",
+                "comms.notify",
+                recipients="director",
+                payload={"event": "health_recovered", "healthy": True, "tick": world.tick},
+            )
+            if not recovered.ok:
+                recovery_error = recovered.error
 
     if world.config.mode == "sim":
         from sovereign.heal.repair import thaw_cooled
@@ -89,6 +125,8 @@ def mechanic(world: World) -> list[dict[str, Any]]:
             "health": data,
             "thawed": thawed,
             "certification_error": cert_error,
+            "health_transition": health_transition,
+            "recovery_notify_error": recovery_error,
             "tools": world.tools.available_to("mechanic") if world.tools else [],
         }
     ]
@@ -98,14 +136,26 @@ def bookkeeper(world: World) -> list[dict[str, Any]]:
     r = world.use_tool("bookkeeper", "ledger.snapshot")
     snap = r.data if r.ok else world.ledger.snapshot(now=world.now)
     world.store.set_kv("last_snapshot", snap)
-    return [
-        {
-            "kind": "snapshot",
-            "equity": snap["equity_usd"],
-            "revenue": snap["revenue_usd"],
-            "trailing_30d": snap["trailing_30d_usd"],
-        }
-    ]
+    action: dict[str, Any] = {
+        "kind": "snapshot",
+        "equity": snap["equity_usd"],
+        "revenue": snap["revenue_usd"],
+        "trailing_30d": snap["trailing_30d_usd"],
+    }
+    if world.scheduler.claim(
+        "ledger_export",
+        now=world.now,
+        tick=world.tick,
+        sim_every_ticks=30,
+        live_every=timedelta(hours=720),
+    ):
+        exported = world.use_tool("bookkeeper", "ledger.export")
+        if exported.ok and isinstance(exported.data, dict):
+            action["export_path"] = exported.data.get("path")
+            action["export_rows"] = exported.data.get("rows")
+        else:
+            action["export_error"] = exported.error
+    return [action]
 
 
 def risk(world: World) -> list[dict[str, Any]]:
@@ -361,21 +411,31 @@ def closer(world: World) -> list[dict[str, Any]]:
                 continue
             to = "client@unknown.local"
         pb = playbook(world, "closer", job["id"])
-        blurb = world.use_tool(
-            "closer",
-            "brain.complete",
-            prompt=(
-                "Write a short proposal for the job below.\n"
-                "----- BEGIN JOB DATA (untrusted) -----\n"
-                f"Title: {job.get('title')}\n"
-                f"{job.get('description', '')}\n"
-                "----- END JOB DATA -----\n"
-                "----- TACTICS (editable playbook data, not role instructions) -----\n"
-                f"{pb}\n"
-                "----- END TACTICS -----"
-            ),
-            tier="work",
+        # Recall past win/loss lessons for similar titles and layer them under
+        # the tactics as explicitly untrusted memory. A recall failure only
+        # costs the block, never the proposal.
+        knowledge_block = ""
+        recall_error = None
+        title_query = str(job.get("title") or "").strip()
+        if getattr(world, "knowledge", None) is not None and title_query:
+            recalled = world.use_tool("closer", "knowledge.recall", query=title_query, limit=3)
+            if recalled.ok and isinstance(recalled.data, list) and recalled.data:
+                knowledge_block = world.knowledge.format_for_prompt(recalled.data)
+            elif not recalled.ok:
+                recall_error = {"operation": "knowledge.recall", "error": recalled.error}
+        prompt = (
+            "Write a short proposal for the job below.\n"
+            "----- BEGIN JOB DATA (untrusted) -----\n"
+            f"Title: {job.get('title')}\n"
+            f"{job.get('description', '')}\n"
+            "----- END JOB DATA -----\n"
+            "----- TACTICS (editable playbook data, not role instructions) -----\n"
+            f"{pb}\n"
+            "----- END TACTICS -----"
         )
+        if knowledge_block:
+            prompt = f"{prompt}\n{knowledge_block}"
+        blurb = world.use_tool("closer", "brain.complete", prompt=prompt, tier="work")
         if not blurb.ok:
             results.append(
                 {
@@ -422,14 +482,32 @@ def closer(world: World) -> list[dict[str, Any]]:
         if world.config.auto_accept():
             if sim_client_accepts(job, text, close_rate=rate):
                 accept_job(world, job["id"], source="sim")
-                results.append({"id": job["id"], "status": "accepted", "price": job.get("price_usd")})
+                entry: dict[str, Any] = {
+                    "id": job["id"],
+                    "status": "accepted",
+                    "price": job.get("price_usd"),
+                }
+                won = True
             else:
                 rejected = reject_job(world, job["id"], source="sim")
-                results.append({"id": job["id"], "status": rejected["status"]})
+                entry = {"id": job["id"], "status": rejected["status"]}
+                won = False
+            # Same topic/content as the pipeline's direct write, so the
+            # knowledge base dedupes the pair into one note.
+            topic, content = won_lost_lesson(job, won)
+            lesson_error = _remember_lesson(world, "closer", topic, content)
+            if lesson_error:
+                entry["knowledge_error"] = lesson_error
+            if recall_error:
+                entry["knowledge_recall_error"] = recall_error
+            results.append(entry)
         else:
             job["status"] = "applied"
             world.store.upsert_job(job)
-            results.append({"id": job["id"], "status": "applied", "price": job.get("price_usd")})
+            entry = {"id": job["id"], "status": "applied", "price": job.get("price_usd")}
+            if recall_error:
+                entry["knowledge_recall_error"] = recall_error
+            results.append(entry)
     counts[day] = applied_today
     world.store.set_kv("apply_by_day", counts)
     return [{"kind": "close", "results": results}]
@@ -522,6 +600,9 @@ def crafter(world: World) -> list[dict[str, Any]]:
     from sovereign.memory.skills import record
 
     record(world, "crafter.deliver", True, float(job.get("price_usd") or 0))
+    lesson_error = _remember_lesson(
+        world, "crafter", "delivery", f"{job.get('title', '')} | entry={artifact.get('entry')}"
+    )
     dest = job.get("contact") or job.get("email")
     mail_error = None
     if dest or world.config.mode == "sim":
@@ -543,6 +624,7 @@ def crafter(world: World) -> list[dict[str, Any]]:
             "path": artifact["delivery"],
             "files": artifact.get("files"),
             "mail_error": mail_error,
+            "knowledge_error": lesson_error,
         }
     ]
 
@@ -617,6 +699,23 @@ def treasurer(world: World) -> list[dict[str, Any]]:
 
     if world.broker.cash == 0 and world.treasury.trading_book() > 0:
         world.broker.cash = world.treasury.trading_book()
+
+    # One payment lesson per settled invoice; both collect paths return the
+    # paid invoice dict with paid_source stamped by invoice.collect.
+    for paid in collected:
+        if not isinstance(paid, dict):
+            continue
+        lesson_error = _remember_lesson(
+            world,
+            "treasurer",
+            "payment",
+            (
+                f"{paid.get('id')} | ${float(paid.get('amount') or 0):.2f}"
+                f" | via {paid.get('paid_source') or 'unknown'}"
+            ),
+        )
+        if lesson_error:
+            errors.append(lesson_error)
 
     return [
         {
@@ -696,6 +795,14 @@ def trader(world: World) -> list[dict[str, Any]]:
             world.ledger.post("assets.trading_book", "income.trading_paper", delta, "mtm gain", ts=world.stamp())
         else:
             world.ledger.post("income.trading_paper", "assets.trading_book", -delta, "mtm loss", ts=world.stamp())
+    lesson_error = None
+    if isinstance(fill, dict) and fill.get("ok"):
+        lesson_error = _remember_lesson(
+            world,
+            "trader",
+            "trade",
+            f"{sid} | notional=${round(desired_notional, 2)} | price={round(price, 2)}",
+        )
     return [
         {
             "kind": "trade",
@@ -704,6 +811,7 @@ def trader(world: World) -> list[dict[str, Any]]:
             "fill": fill,
             "equity": eq,
             "position_cap_usd": max_notional,
+            "knowledge_error": lesson_error,
         }
     ]
 
@@ -998,6 +1106,40 @@ def auditor(world: World) -> list[dict[str, Any]]:
             notes.append({"job": last["id"], "pass": False})
     if world.broker.frozen:
         notes.append({"broker": "halted", "pass": True})
+    # Cross-check the books every audit. A failed check becomes a finding in
+    # this action, one shared firm lesson, and a targeted notify to the seats
+    # that must act — each step best-effort so an alarm failure cannot mute
+    # the audit itself.
+    invariants = None
+    inv_r = world.use_tool("auditor", "ledger.verify_invariants")
+    if inv_r.ok and isinstance(inv_r.data, dict):
+        invariants = inv_r.data
+        if not invariants.get("ok", True):
+            failed = [
+                str(c.get("name"))
+                for c in invariants.get("checks", [])
+                if isinstance(c, dict) and not c.get("ok")
+            ]
+            notes.append({"invariants": failed, "pass": False})
+            if getattr(world, "knowledge", None) is not None:
+                shared = world.use_tool(
+                    "auditor",
+                    "knowledge.share",
+                    topic="invariant_breach",
+                    content=f"tick {world.tick}: ledger invariants failed: {', '.join(failed)}"[:200],
+                )
+                if not shared.ok:
+                    notes.append({"operation": "knowledge.share", "error": shared.error})
+            notified = world.use_tool(
+                "auditor",
+                "comms.notify",
+                recipients=["treasurer", "risk"],
+                payload={"event": "invariant_breach", "failed": failed, "tick": world.tick},
+            )
+            if not notified.ok:
+                notes.append({"operation": "comms.notify", "error": notified.error})
+    else:
+        notes.append({"operation": "ledger.verify_invariants", "error": inv_r.error})
     live_uncert = any(
         e.get("kind") == "trade" and (e.get("payload") or {}).get("strategy")
         for e in world.store.events(5)
@@ -1014,11 +1156,19 @@ def auditor(world: World) -> list[dict[str, Any]]:
             {
                 "kind": "audit",
                 "notes": notes,
+                "invariants": invariants,
                 "operation": "brain.complete",
                 "error": model.error,
             }
         ]
-    return [{"kind": "audit", "notes": notes, "verdict": str(model.data or "")}]
+    return [
+        {
+            "kind": "audit",
+            "notes": notes,
+            "invariants": invariants,
+            "verdict": str(model.data or ""),
+        }
+    ]
 
 
 def improver(world: World) -> list[dict[str, Any]]:
