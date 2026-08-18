@@ -12,9 +12,12 @@ The firm is **one supervised engine process**, not a fleet.
 - `sovereign run` / `sovereign serve` execute a heartbeat
   (`sovereign/engine/heartbeat.py`). Each tick calls the sixteen agent
   functions in a **fixed, deterministic order** (mechanic first, courier
-  last). The daemon takes a file lock (`data/engine.lock`) so two hearts
-  cannot beat against one database, runs a full heal on start, and heals and
-  continues after a crashed tick.
+  last) unless `workers.enabled` or `sovereign serve --workers` is set.
+  Spawned workers reopen the same SQLite world; mechanic stays in-process;
+  hunter still precedes closer, and closer precedes crafter. The daemon
+  takes a file lock (`data/engine.lock`) so two hearts cannot beat against
+  one database, runs a full heal on start, and heals and continues after a
+  crashed tick. See [`TRADING.md`](TRADING.md).
 - All state lives in a **shared SQLite world** (`data/sovereign.db`, WAL
   mode): ledger, jobs, invoices, mail, offers, missions, votes, outcomes,
   kv, events, and the `messages` table the comms bus persists to. An agent
@@ -266,12 +269,10 @@ treasurer-plus-director quorum (`Council.REQUIRED["buy_infra"]`).
 The contracts are designed so the topology can change without rewriting the
 firm:
 
-- **The bus is already the boundary.** Messages are durable, per-recipient,
-  at-least-once, deadline-scoped rows — exactly the contract a separate
-  worker process or container per agent would consume. A future worker for
-  agent X polls `inbox("X")`, acks, fails, and replies over the same
-  protocol; senders never know whether the recipient is a function call in
-  the same tick or a process on another box.
+- **Workers are optional today.** `workers.enabled` runs eligible agents in
+  spawned processes that call the same `run_one_agent` entry and persist
+  through SQLite. The bus remains the inbox boundary; `sovereign worker
+  --agent NAME --once` runs one role without taking `engine.lock`.
 - **The spec is already the identity.** `AgentSpec` pins name, mission,
   tier, tool grants, handled kinds, and the full system prompt. A packaged
   per-agent worker ships with its spec; the registry (or a service fronting

@@ -272,8 +272,48 @@ def cmd_wallet(args: argparse.Namespace) -> int:
 def cmd_serve(args: argparse.Namespace) -> int:
     from sovereign.engine.daemon import serve
 
-    serve(_config(args), ticks=args.ticks, verbose=True, force=args.force)
+    cfg = _config(args)
+    if getattr(args, "workers", False):
+        cfg.workers.enabled = True
+    serve(cfg, ticks=args.ticks, verbose=True, force=args.force)
     return 0
+
+
+def cmd_trading(args: argparse.Namespace) -> int:
+    world = bootstrap(_config(args), heal=False)
+    snap = dict(world.broker.snapshot())
+    forbidden = ("key", "secret", "mnemonic", "private")
+    for field in list(snap):
+        lowered = str(field).lower()
+        if any(token in lowered for token in forbidden):
+            snap.pop(field, None)
+    payload = {
+        "venue": world.config.trading.venue,
+        "coin": world.config.trading.coin,
+        "hyperliquid_enabled": world.config.trading.hyperliquid_enabled,
+        "testnet": world.config.trading.hyperliquid_testnet,
+        "allow_mainnet": world.config.trading.hyperliquid_allow_mainnet,
+        "broker": snap,
+        "workers": {
+            "enabled": world.config.workers.enabled,
+            "max_procs": world.config.workers.max_procs,
+            "in_process": list(world.config.workers.in_process),
+        },
+    }
+    print(json.dumps(payload, indent=2, default=str))
+    return 0
+
+
+def cmd_worker(args: argparse.Namespace) -> int:
+    from sovereign.engine.workers import PIPELINE_NAMES, run_standalone_agent
+
+    if args.agent not in PIPELINE_NAMES:
+        raise KeyError(
+            f"unknown agent {args.agent!r}; roster: {', '.join(PIPELINE_NAMES)}"
+        )
+    result = run_standalone_agent(_config(args), args.agent)
+    print(json.dumps(result, indent=2, default=str))
+    return 0 if result.get("ok") else 1
 
 
 def cmd_backup(args: argparse.Namespace) -> int:
@@ -773,7 +813,32 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Start even when required readiness checks fail (live gate override)",
     )
+    s.add_argument(
+        "--workers",
+        action="store_true",
+        help="Run eligible agents in spawned worker processes this serve",
+    )
     s.set_defaults(func=cmd_serve)
+
+    s = sub.add_parser(
+        "trading",
+        help="Show Hyperliquid/paper venue status (never keys)",
+    )
+    _globals(s)
+    s.set_defaults(func=cmd_trading)
+
+    s = sub.add_parser(
+        "worker",
+        help="Run one agent against the data dir (does not take engine.lock)",
+    )
+    _globals(s)
+    s.add_argument("--agent", required=True, help="Agent name (e.g. bookkeeper)")
+    s.add_argument(
+        "--once",
+        action="store_true",
+        help="Run a single pass (the only supported mode)",
+    )
+    s.set_defaults(func=cmd_worker)
 
     s = sub.add_parser(
         "backup",

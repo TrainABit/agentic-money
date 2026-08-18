@@ -173,6 +173,38 @@ class RetentionConfig(BaseModel):
     vacuum_on_maintain: bool = True
 
 
+class TradingConfig(BaseModel):
+    """Live trading venue. Sim always stays on the paper broker.
+
+    Hyperliquid is fail-closed: ``hyperliquid_enabled`` defaults false,
+    ``testnet`` defaults true, and mainnet additionally requires
+    ``hyperliquid_allow_mainnet``. This engine never withdraws.
+    """
+
+    venue: Literal["paper", "hyperliquid"] = "paper"
+    coin: str = "BTC"
+    hyperliquid_enabled: bool = False
+    hyperliquid_testnet: bool = True
+    hyperliquid_allow_mainnet: bool = False
+    slippage: float = 0.01
+    min_order_usd: float = 12.0
+    # Tests and local drills: never talks to Hyperliquid. Live default is false.
+    hyperliquid_fake: bool = False
+
+
+class WorkerConfig(BaseModel):
+    """Optional multi-process agent execution.
+
+    Off by default so sim tests stay single-process and deterministic.
+    When enabled, agents not in ``in_process`` run in spawned workers
+    that reopen the same SQLite world. Mechanic always stays in-process.
+    """
+
+    enabled: bool = False
+    max_procs: int = 4
+    in_process: tuple[str, ...] = ("mechanic", "courier")
+
+
 class EngineConfig(BaseModel):
     mode: Mode = "sim"
     data_dir: Path = Field(default_factory=lambda: Path("data"))
@@ -190,6 +222,8 @@ class EngineConfig(BaseModel):
     alerts: AlertConfig = Field(default_factory=AlertConfig)
     wallet: WalletConfig = Field(default_factory=WalletConfig)
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
+    trading: TradingConfig = Field(default_factory=TradingConfig)
+    workers: WorkerConfig = Field(default_factory=WorkerConfig)
     goals: Goals = Field(default_factory=Goals)
     risk: RiskLimits = Field(default_factory=RiskLimits)
     models: ModelConfig = Field(default_factory=ModelConfig)

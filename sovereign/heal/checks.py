@@ -238,7 +238,7 @@ def diagnose(world: "World", deep: bool = False) -> list[Finding]:
 
     # Informational only: web automation is opt-in, so its state can never
     # fail health or trigger a repair.
-    from sovereign.ops import _mcp_summary, _web_summary
+    from sovereign.ops import _mcp_summary, _trading_summary, _web_summary
 
     web = _web_summary(world)
     out.append(Finding(
@@ -260,6 +260,18 @@ def diagnose(world: "World", deep: bool = False) -> list[Finding]:
         detail=(
             f"enabled={mcp['enabled']} sdk={mcp['sdk']} "
             f"servers={mcp['servers']} errors={mcp['errors']}"
+        ),
+        repairable=False,
+    ))
+
+    trading = _trading_summary(world)
+    out.append(Finding(
+        "trading",
+        ok=True,
+        detail=(
+            f"venue={trading['venue']} coin={trading['coin']} "
+            f"enabled={trading['hyperliquid_enabled']} "
+            f"testnet={trading['testnet']} sdk={trading['sdk']}"
         ),
         repairable=False,
     ))

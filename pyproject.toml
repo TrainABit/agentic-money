@@ -42,6 +42,9 @@ web = [
 keyring = [
   "keyring>=24",
 ]
+hyperliquid = [
+  "hyperliquid-python-sdk>=0.18.0",
+]
 
 [project.scripts]
 sovereign = "sovereign.cli:main"

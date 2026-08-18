@@ -5,12 +5,13 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from sovereign.config import RiskLimits
-from sovereign.engine.schedule import aware_utc
+from sovereign.engine.schedule import aware_utc, parse_datetime
 
 
 @dataclass
 class PaperBroker:
     cash: float
+    venue: str = "paper"
     position: float = 0.0
     last_price: float = 0.0
     equity_high: float = 0.0
@@ -130,8 +131,30 @@ class PaperBroker:
         self.fills.append(fill)
         return {"ok": True, **fill}
 
+    def restore(self, snap: dict[str, Any], *, now: datetime | None = None) -> None:
+        """Reload fields persisted by :meth:`snapshot`. Extra keys are ignored."""
+        if not snap:
+            return
+        if snap.get("venue"):
+            self.venue = str(snap["venue"])
+        self.cash = float(snap.get("cash", self.cash))
+        self.position = float(snap.get("position", self.position))
+        self.last_price = float(snap.get("last_price", self.last_price))
+        self.frozen = bool(snap.get("frozen", self.frozen))
+        self.day_start_equity = float(snap.get("day_start_equity") or self.day_start_equity or 0)
+        self.week_start_equity = float(snap.get("week_start_equity") or self.week_start_equity or 0)
+        self.day_key = str(snap.get("day_key") or self.day_key or "")
+        self.week_key = str(snap.get("week_key") or self.week_key or "")
+        ht = snap.get("halt_tick")
+        self.halt_tick = int(ht) if ht is not None else None
+        self.halted_at = parse_datetime(snap.get("halted_at"))
+        self.halt_reason = str(snap.get("halt_reason") or "") or None
+        if self.frozen and self.halted_at is None and now is not None:
+            self.halted_at = aware_utc(now)
+
     def snapshot(self) -> dict[str, Any]:
         return {
+            "venue": self.venue,
             "cash": round(self.cash, 4),
             "position": round(self.position, 8),
             "last_price": self.last_price,

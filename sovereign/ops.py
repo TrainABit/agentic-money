@@ -199,6 +199,8 @@ def readiness(world: "World") -> dict[str, Any]:
 
     checks.append(_check("mcp", True, False, _mcp_summary(world)))
 
+    checks.append(_check("trading", True, False, _trading_summary(world)))
+
     ready = all(check["ok"] for check in checks if check["required"])
     return {"ready": ready, "mode": world.config.mode, "checks": checks}
 
@@ -214,6 +216,22 @@ def _web_summary(world: "World") -> dict[str, Any]:
         "enabled": bool(getattr(getattr(world, "web", None), "enabled", False)),
         "playwright": importlib.util.find_spec("playwright") is not None,
         "vaulted_sessions": vaulted,
+    }
+
+
+def _trading_summary(world: "World") -> dict[str, Any]:
+    """Informational Hyperliquid/paper venue state: never keys, never network."""
+    trading = world.config.trading
+    broker = getattr(world, "broker", None)
+    return {
+        "venue": trading.venue,
+        "coin": trading.coin,
+        "hyperliquid_enabled": trading.hyperliquid_enabled,
+        "testnet": trading.hyperliquid_testnet,
+        "allow_mainnet": trading.hyperliquid_allow_mainnet,
+        "broker_venue": getattr(broker, "venue", "paper"),
+        "workers_enabled": world.config.workers.enabled,
+        "sdk": importlib.util.find_spec("hyperliquid") is not None,
     }
 
 
