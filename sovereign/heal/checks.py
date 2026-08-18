@@ -53,7 +53,22 @@ def diagnose(world: "World", deep: bool = False) -> list[Finding]:
         except Exception as e:
             out.append(Finding("sqlite", False, str(e)[:200], repairable=False))
 
-    needed = {"events", "ledger", "missions", "jobs", "votes", "outcomes", "kv", "invoices", "mail", "offers"}
+    needed = {
+        "events",
+        "ledger",
+        "missions",
+        "jobs",
+        "votes",
+        "outcomes",
+        "kv",
+        "invoices",
+        "mail",
+        "offers",
+        "messages",
+        "knowledge",
+        "chain_txids",
+        "schema_log",
+    }
     have = {r[0] for r in world.store.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     miss_t = sorted(needed - have)
     out.append(Finding(
@@ -63,6 +78,18 @@ def diagnose(world: "World", deep: bool = False) -> list[Finding]:
         repairable=bool(miss_t),
         repair="migrate",
     ))
+    from sovereign.memory.store import CURRENT_SCHEMA_VERSION
+
+    version = world.store.schema_version()
+    out.append(
+        Finding(
+            "schema_version",
+            ok=version >= CURRENT_SCHEMA_VERSION,
+            detail=f"user_version={version} current={CURRENT_SCHEMA_VERSION}",
+            repairable=version < CURRENT_SCHEMA_VERSION,
+            repair="migrate",
+        )
+    )
 
     try:
         pub = world.wallet.public()
@@ -80,6 +107,24 @@ def diagnose(world: "World", deep: bool = False) -> list[Finding]:
                 "mnemonic restores ETH and SOL"
                 if backup_ok
                 else "legacy SOL key requires secrets.enc backup",
+                repairable=False,
+            )
+        )
+        backend = getattr(getattr(world.config, "wallet", None), "master_key_backend", "file")
+        has_file = paths.master_key.exists()
+        if backend == "keyring":
+            custody_detail = "keyring backend"
+            if has_file:
+                custody_detail += " (master.key file still present; safe to remove after verify)"
+        else:
+            custody_detail = (
+                "file backend; master.key present" if has_file else "file backend; master.key missing"
+            )
+        out.append(
+            Finding(
+                "master_key_custody",
+                ok=backend == "keyring" or has_file,
+                detail=custody_detail,
                 repairable=False,
             )
         )

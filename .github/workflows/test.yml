@@ -26,7 +26,9 @@ jobs:
       - name: Compile
         run: python -m compileall -q sovereign tests
       - name: Test
-        run: python -m pytest -q
+        # Coverage floor is data-driven: the suite measured 85% total
+        # (2026-08-18), so the gate sits a few points below at 82%.
+        run: python -m pytest --cov=sovereign --cov-report=term-missing --cov-report=xml --cov-fail-under=82 -q
       - name: Build distributions
         run: python -m build
       - name: Smoke-test wheel import
@@ -34,3 +36,76 @@ jobs:
           python -m pip install --no-deps --target "$RUNNER_TEMP/sovereign-wheel" dist/*.whl
           cd "$RUNNER_TEMP"
           PYTHONPATH="$RUNNER_TEMP/sovereign-wheel" python -c "import sovereign; import sovereign.cli"
+
+  security:
+    # Advisory scanners: findings stay visible in the logs and the job badge,
+    # but a pre-existing baseline finding never blocks merges.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install -e ".[dev]"
+          python -m pip install pip-audit bandit
+      - name: Audit installed dependencies
+        # Step-level continue-on-error so bandit still runs after findings.
+        continue-on-error: true
+        run: pip-audit
+      - name: Bandit static scan
+        run: bandit -r sovereign -ll
+
+  integration-extras:
+    # Real-browser and real-MCP integration tests gated behind the web/mcp
+    # extras; both suites are known-good with the extras installed.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install with web and mcp extras
+        run: python -m pip install -e ".[dev,web,mcp]"
+      - name: Install chromium
+        run: python -m playwright install --with-deps chromium || python -m playwright install chromium
+      - name: Run gated web and MCP integration tests
+        env:
+          SOVEREIGN_WEB_IT: "1"
+          SOVEREIGN_MCP_IT: "1"
+        run: python -m pytest tests/test_web_session.py tests/test_mcp_client.py -q
+
+  typing:
+    # Advisory on the full package: a pre-existing untyped baseline must not
+    # block merges. The required subset below is the productionization surface.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: Type-check productionization modules
+        run: >
+          python -m mypy
+          sovereign/config.py
+          sovereign/backup.py
+          sovereign/security.py
+          sovereign/fileio.py
+          sovereign/capital/invariants.py
+      - name: Type-check full package (advisory)
+        continue-on-error: true
+        run: python -m mypy sovereign

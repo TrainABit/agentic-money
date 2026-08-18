@@ -7,7 +7,7 @@ from typing import Any
 
 from sovereign.capital.ledger import Ledger
 from sovereign.capital.treasury import Treasury
-from sovereign.capital.wallet import Wallet, derive_solana_keypair
+from sovereign.capital.wallet import Wallet, derive_solana_keypair, master_key_store_from_config
 from sovereign.channels.human import HumanInbox
 from sovereign.config import EngineConfig
 from sovereign.debug import TraceCollector
@@ -364,12 +364,16 @@ def bootstrap(config: EngineConfig, *, heal: bool = True, clock: Clock | None = 
     paths = config.paths()
     paths.ensure()
     seed_playbooks(paths.playbooks)
-    store = Store(paths.db)
+    store = Store(paths.db, event_retention=config.retention.event_rows)
     active_clock = clock or SystemClock()
     initial_now = aware_utc(active_clock.now())
     ledger = Ledger(store)
     treasury = Treasury(ledger, config)
-    wallet = Wallet(paths.secrets, paths.master_key)
+    wallet = Wallet(
+        paths.secrets,
+        paths.master_key,
+        key_store=master_key_store_from_config(config, paths),
+    )
     bundle_pub = wallet.load_or_create()
     derived_sol_address, _ = derive_solana_keypair(bundle_pub.mnemonic)
     if (

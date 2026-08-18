@@ -153,6 +153,26 @@ class LiveTiming(BaseModel):
     mail_poll_minutes: float = 5.0
 
 
+class WalletConfig(BaseModel):
+    """Custody of the wallet's Fernet master key.
+
+    "file" is today's default (master.key beside secrets.enc); "keyring"
+    moves the key into the OS keyring (needs the optional [keyring] extra).
+    """
+
+    master_key_backend: Literal["file", "keyring"] = "file"
+    keyring_service: str = "sovereign"
+    keyring_username: str = "master_key"
+
+
+class RetentionConfig(BaseModel):
+    """Event/comms retention and compaction used by ``sovereign maintain``."""
+
+    event_rows: int = 10_000
+    comms_days: float = 30.0
+    vacuum_on_maintain: bool = True
+
+
 class EngineConfig(BaseModel):
     mode: Mode = "sim"
     data_dir: Path = Field(default_factory=lambda: Path("data"))
@@ -168,6 +188,8 @@ class EngineConfig(BaseModel):
     mcp: McpConfig = Field(default_factory=McpConfig)
     chain: ChainConfig = Field(default_factory=ChainConfig)
     alerts: AlertConfig = Field(default_factory=AlertConfig)
+    wallet: WalletConfig = Field(default_factory=WalletConfig)
+    retention: RetentionConfig = Field(default_factory=RetentionConfig)
     goals: Goals = Field(default_factory=Goals)
     risk: RiskLimits = Field(default_factory=RiskLimits)
     models: ModelConfig = Field(default_factory=ModelConfig)

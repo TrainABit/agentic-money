@@ -8,7 +8,7 @@ import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 
 def utcnow() -> datetime:
@@ -92,6 +92,189 @@ def _message_params(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_BASELINE_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      agent TEXT,
+      payload TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS ledger (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL,
+      debit TEXT NOT NULL,
+      credit TEXT NOT NULL,
+      amount REAL NOT NULL,
+      memo TEXT NOT NULL,
+      ref TEXT
+    );
+    CREATE TABLE IF NOT EXISTS missions (
+      id TEXT PRIMARY KEY,
+      play_id TEXT NOT NULL,
+      agent TEXT NOT NULL,
+      title TEXT NOT NULL,
+      status TEXT NOT NULL,
+      budget_usd REAL NOT NULL,
+      created_ts TEXT NOT NULL,
+      payload TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS jobs (
+      id TEXT PRIMARY KEY,
+      source TEXT NOT NULL,
+      title TEXT NOT NULL,
+      status TEXT NOT NULL,
+      price_usd REAL NOT NULL,
+      payload TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS votes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL,
+      action_id TEXT NOT NULL,
+      agent TEXT NOT NULL,
+      choice TEXT NOT NULL,
+      reason TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS outcomes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL,
+      play_id TEXT,
+      agent TEXT,
+      kind TEXT NOT NULL,
+      usd REAL NOT NULL,
+      success INTEGER NOT NULL,
+      note TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS kv (
+      k TEXT PRIMARY KEY,
+      v TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS invoices (
+      id TEXT PRIMARY KEY,
+      ts TEXT NOT NULL,
+      job_id TEXT NOT NULL,
+      amount REAL NOT NULL,
+      status TEXT NOT NULL,
+      income_account TEXT NOT NULL,
+      payload TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS mail (
+      id TEXT PRIMARY KEY,
+      ts TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      address TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      status TEXT NOT NULL,
+      payload TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS offers (
+      id TEXT PRIMARY KEY,
+      ts TEXT NOT NULL,
+      title TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      price_usd REAL NOT NULL,
+      status TEXT NOT NULL,
+      payload TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS messages (
+      id TEXT PRIMARY KEY,
+      ts TEXT NOT NULL,
+      thread_id TEXT NOT NULL,
+      correlation_id TEXT NOT NULL,
+      sender TEXT NOT NULL,
+      recipient TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      status TEXT NOT NULL,
+      expects_reply INTEGER NOT NULL DEFAULT 0,
+      reply_to TEXT,
+      deadline TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      max_attempts INTEGER NOT NULL DEFAULT 3,
+      error TEXT
+    );
+    CREATE TABLE IF NOT EXISTS knowledge (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL,
+      agent TEXT NOT NULL,
+      topic TEXT NOT NULL,
+      content TEXT NOT NULL,
+      source TEXT NOT NULL,
+      confidence REAL NOT NULL,
+      use_count INTEGER NOT NULL DEFAULT 0,
+      last_used_ts TEXT
+    );
+    CREATE TABLE IF NOT EXISTS chain_txids (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL,
+      chain TEXT NOT NULL,
+      txid TEXT NOT NULL,
+      amount_minor INTEGER NOT NULL,
+      sender TEXT,
+      invoice_id TEXT,
+      UNIQUE(chain, txid)
+    );
+    CREATE INDEX IF NOT EXISTS idx_chain_txids_chain_txid ON chain_txids(chain, txid);
+    CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+    CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status);
+    CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);
+    CREATE INDEX IF NOT EXISTS idx_ledger_ts ON ledger(ts);
+    CREATE INDEX IF NOT EXISTS idx_messages_recipient_status ON messages(recipient, status);
+    CREATE INDEX IF NOT EXISTS idx_messages_correlation ON messages(correlation_id);
+    CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id);
+    CREATE INDEX IF NOT EXISTS idx_messages_status_deadline ON messages(status, deadline);
+    CREATE INDEX IF NOT EXISTS idx_knowledge_agent_ts ON knowledge(agent, ts);
+"""
+
+
+def _migration_0001_baseline(conn: sqlite3.Connection) -> None:
+    """Schema version 1: the full pre-versioning schema, unchanged.
+
+    Pure CREATE ... IF NOT EXISTS, so it is safe on a fresh database and on
+    any database created by the old unversioned ``_migrate`` (user_version 0).
+    """
+    conn.executescript(_BASELINE_SCHEMA)
+
+
+def _migration_0002_schema_log_and_event_index(conn: sqlite3.Connection) -> None:
+    """Schema version 2: migration audit log plus an events(ts) index.
+
+    ``schema_log`` is the operator-visible history of applied versions.
+    ``idx_events_ts`` speeds retention scans that already prune by recency.
+    """
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS schema_log (
+          version INTEGER PRIMARY KEY,
+          applied_ts TEXT NOT NULL,
+          name TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+        """
+    )
+    applied = iso()
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_log(version, applied_ts, name) VALUES (?,?,?)",
+        (1, applied, "baseline"),
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_log(version, applied_ts, name) VALUES (?,?,?)",
+        (2, applied, "schema_log_and_event_index"),
+    )
+
+
+# Ordered, append-only migration chain: entry i applies schema version i + 1,
+# tracked in ``PRAGMA user_version``. Future migrations must be additive
+# (add a table/index/column) and idempotent-safe: the baseline is re-run on
+# every open as the heal/repair path, and a crash between a migration and its
+# version bump must be safe to replay.
+_MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
+    _migration_0001_baseline,
+    _migration_0002_schema_log_and_event_index,
+]
+CURRENT_SCHEMA_VERSION = len(_MIGRATIONS)
+
+
 class Store:
     def __init__(self, db_path: Path, event_retention: int | None = 10_000) -> None:
         self.db_path = db_path
@@ -168,145 +351,61 @@ class Store:
                     self.conn.rollback()
                 raise
 
-    def _migrate(self) -> None:
+    def schema_version(self) -> int:
+        """Schema version recorded in the database (``PRAGMA user_version``)."""
         with self._lock:
-            self.conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS events (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  ts TEXT NOT NULL,
-                  kind TEXT NOT NULL,
-                  agent TEXT,
-                  payload TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS ledger (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  ts TEXT NOT NULL,
-                  debit TEXT NOT NULL,
-                  credit TEXT NOT NULL,
-                  amount REAL NOT NULL,
-                  memo TEXT NOT NULL,
-                  ref TEXT
-                );
-                CREATE TABLE IF NOT EXISTS missions (
-                  id TEXT PRIMARY KEY,
-                  play_id TEXT NOT NULL,
-                  agent TEXT NOT NULL,
-                  title TEXT NOT NULL,
-                  status TEXT NOT NULL,
-                  budget_usd REAL NOT NULL,
-                  created_ts TEXT NOT NULL,
-                  payload TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS jobs (
-                  id TEXT PRIMARY KEY,
-                  source TEXT NOT NULL,
-                  title TEXT NOT NULL,
-                  status TEXT NOT NULL,
-                  price_usd REAL NOT NULL,
-                  payload TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS votes (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  ts TEXT NOT NULL,
-                  action_id TEXT NOT NULL,
-                  agent TEXT NOT NULL,
-                  choice TEXT NOT NULL,
-                  reason TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS outcomes (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  ts TEXT NOT NULL,
-                  play_id TEXT,
-                  agent TEXT,
-                  kind TEXT NOT NULL,
-                  usd REAL NOT NULL,
-                  success INTEGER NOT NULL,
-                  note TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS kv (
-                  k TEXT PRIMARY KEY,
-                  v TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS invoices (
-                  id TEXT PRIMARY KEY,
-                  ts TEXT NOT NULL,
-                  job_id TEXT NOT NULL,
-                  amount REAL NOT NULL,
-                  status TEXT NOT NULL,
-                  income_account TEXT NOT NULL,
-                  payload TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS mail (
-                  id TEXT PRIMARY KEY,
-                  ts TEXT NOT NULL,
-                  direction TEXT NOT NULL,
-                  address TEXT NOT NULL,
-                  subject TEXT NOT NULL,
-                  status TEXT NOT NULL,
-                  payload TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS offers (
-                  id TEXT PRIMARY KEY,
-                  ts TEXT NOT NULL,
-                  title TEXT NOT NULL,
-                  kind TEXT NOT NULL,
-                  price_usd REAL NOT NULL,
-                  status TEXT NOT NULL,
-                  payload TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS messages (
-                  id TEXT PRIMARY KEY,
-                  ts TEXT NOT NULL,
-                  thread_id TEXT NOT NULL,
-                  correlation_id TEXT NOT NULL,
-                  sender TEXT NOT NULL,
-                  recipient TEXT NOT NULL,
-                  kind TEXT NOT NULL,
-                  payload TEXT NOT NULL,
-                  status TEXT NOT NULL,
-                  expects_reply INTEGER NOT NULL DEFAULT 0,
-                  reply_to TEXT,
-                  deadline TEXT,
-                  attempts INTEGER NOT NULL DEFAULT 0,
-                  max_attempts INTEGER NOT NULL DEFAULT 3,
-                  error TEXT
-                );
-                CREATE TABLE IF NOT EXISTS knowledge (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  ts TEXT NOT NULL,
-                  agent TEXT NOT NULL,
-                  topic TEXT NOT NULL,
-                  content TEXT NOT NULL,
-                  source TEXT NOT NULL,
-                  confidence REAL NOT NULL,
-                  use_count INTEGER NOT NULL DEFAULT 0,
-                  last_used_ts TEXT
-                );
-                CREATE TABLE IF NOT EXISTS chain_txids (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  ts TEXT NOT NULL,
-                  chain TEXT NOT NULL,
-                  txid TEXT NOT NULL,
-                  amount_minor INTEGER NOT NULL,
-                  sender TEXT,
-                  invoice_id TEXT,
-                  UNIQUE(chain, txid)
-                );
-                CREATE INDEX IF NOT EXISTS idx_chain_txids_chain_txid ON chain_txids(chain, txid);
-                CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
-                CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status);
-                CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);
-                CREATE INDEX IF NOT EXISTS idx_ledger_ts ON ledger(ts);
-                CREATE INDEX IF NOT EXISTS idx_messages_recipient_status ON messages(recipient, status);
-                CREATE INDEX IF NOT EXISTS idx_messages_correlation ON messages(correlation_id);
-                CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id);
-                CREATE INDEX IF NOT EXISTS idx_messages_status_deadline ON messages(status, deadline);
-                CREATE INDEX IF NOT EXISTS idx_knowledge_agent_ts ON knowledge(agent, ts);
-                """
-            )
+            return int(self.conn.execute("PRAGMA user_version").fetchone()[0])
+
+    def _migrate(self) -> None:
+        """Bring the schema to the current version; idempotent, callable anytime.
+
+        ``PRAGMA user_version`` counts applied migrations. 0 means a fresh
+        database or one created by the old unversioned ``_migrate``; the
+        baseline (version 1) handles both. The baseline is also re-run when
+        the version is already current because heal/repair calls this method
+        to restore dropped tables and indexes. Pending migrations then apply
+        in order, each bumping user_version once it lands.
+        """
+        with self._lock:
+            version = self.schema_version()
+            if version >= 1:
+                _MIGRATIONS[0](self.conn)
+            for target, migration in enumerate(_MIGRATIONS, start=1):
+                if target <= version:
+                    continue
+                migration(self.conn)
+                self.conn.execute(f"PRAGMA user_version = {int(target)}")
             self.conn.commit()
             self._migrate_fts()
+
+    def schema_history(self) -> list[dict[str, Any]]:
+        """Applied migration rows from ``schema_log`` (empty before version 2)."""
+        with self._lock:
+            have = {
+                str(row[0])
+                for row in self.conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_log'"
+                )
+            }
+            if not have:
+                return []
+            rows = self.conn.execute(
+                "SELECT version, applied_ts, name FROM schema_log ORDER BY version ASC"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def vacuum(self) -> None:
+        """Compact the database file (retention/compaction story).
+
+        VACUUM rebuilds the main database, reclaiming free pages; in WAL mode
+        a TRUNCATE checkpoint then shrinks the -wal file too. Must run outside
+        any transaction (SQLite raises otherwise).
+        """
+        with self._lock:
+            self.conn.execute("VACUUM")
+            mode = str(self.conn.execute("PRAGMA journal_mode").fetchone()[0])
+            if mode.lower() == "wal":
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     def _migrate_fts(self) -> None:
         """Feature-detect FTS5 and build the external-content knowledge index.

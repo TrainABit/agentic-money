@@ -1,0 +1,51 @@
+# Compose stack for one engine + the observer dashboard.
+# From the repository root:
+#   export SOVEREIGN_DASHBOARD_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+#   docker compose -f deploy/docker-compose.yml up --build
+#
+# The dashboard binds 0.0.0.0 inside the container so published ports work;
+# a bearer token is therefore required. Put a reverse proxy with TLS in front
+# of any non-loopback exposure.
+
+services:
+  engine:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: sovereign:local
+    restart: unless-stopped
+    volumes:
+      - sovereign-data:/data
+    environment:
+      SOVEREIGN_MODE: ${SOVEREIGN_MODE:-sim}
+    command: ["serve", "--data-dir", "/data", "--mode", "${SOVEREIGN_MODE:-sim}"]
+    healthcheck:
+      test: ["CMD", "sovereign", "healthcheck", "--data-dir", "/data", "--stale-seconds", "300"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 90s
+
+  dashboard:
+    image: sovereign:local
+    restart: unless-stopped
+    depends_on:
+      engine:
+        condition: service_started
+    volumes:
+      - sovereign-data:/data
+    ports:
+      - "127.0.0.1:7474:7474"
+    environment:
+      SOVEREIGN_DASHBOARD_TOKEN: ${SOVEREIGN_DASHBOARD_TOKEN:?set SOVEREIGN_DASHBOARD_TOKEN}
+    command:
+      - "dashboard"
+      - "--data-dir"
+      - "/data"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "7474"
+
+volumes:
+  sovereign-data:
