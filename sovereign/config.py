@@ -41,6 +41,13 @@ class ModelConfig(BaseModel):
     # "off" keeps the CLI tool allowlist only; "auto" wraps with bubblewrap
     # when it is installed; "bwrap" requires bubblewrap and fails closed.
     sandbox: Literal["off", "auto", "bwrap"] = "auto"
+    # HTTP API fallback provider (used only when provider == "api", or when
+    # allow_api_fallback is set and the Claude CLI is unavailable/failing).
+    # The key is a vault credential reference, never a literal secret.
+    api_style: Literal["anthropic", "openai"] = "anthropic"
+    api_base_url: str = "https://api.anthropic.com/v1/messages"
+    api_key_ref: str = "ANTHROPIC_API_KEY"
+    api_timeout_s: float = 60.0
 
 
 class SimConfig(BaseModel):
@@ -103,6 +110,26 @@ class McpConfig(BaseModel):
     servers: tuple[McpServerConfig, ...] = ()
 
 
+class ChainConfig(BaseModel):
+    """On-chain settlement: prefer parsing transfer logs over balance deltas."""
+
+    use_tx_logs: bool = True
+    eth_lookback_blocks: int = 50_000
+    eth_confirmations: int = 5
+    sol_lookback_sigs: int = 200
+
+
+class AlertConfig(BaseModel):
+    """Push P0/P1 incidents (invariant breach, dead letters, halts) out of band."""
+
+    enabled: bool = False
+    channel: Literal["mail", "webhook"] = "mail"
+    to: str = ""  # email recipient when channel == "mail"
+    webhook_url: str | None = None
+    min_severity: Literal["P0", "P1", "P2"] = "P0"
+    throttle_minutes: float = 60.0
+
+
 class LiveTiming(BaseModel):
     """Wall-clock lifecycle limits and bounded live cadences."""
 
@@ -132,10 +159,15 @@ class EngineConfig(BaseModel):
     tick_seconds: float = 15.0
     # Live-mode sleep between ticks when the engine reports no active work.
     idle_tick_seconds: float = 60.0
+    # Hard per-agent wall-clock budget: a wedged agent is abandoned so the
+    # rest of the tick (and the firm) keeps running.
+    agent_timeout_seconds: float = 30.0
     tick_hours: float = 24.0
     debug: DebugConfig = Field(default_factory=DebugConfig)
     web: WebConfig = Field(default_factory=WebConfig)
     mcp: McpConfig = Field(default_factory=McpConfig)
+    chain: ChainConfig = Field(default_factory=ChainConfig)
+    alerts: AlertConfig = Field(default_factory=AlertConfig)
     goals: Goals = Field(default_factory=Goals)
     risk: RiskLimits = Field(default_factory=RiskLimits)
     models: ModelConfig = Field(default_factory=ModelConfig)
