@@ -70,6 +70,7 @@ class LiveTiming(BaseModel):
     certification_failure_retry_minutes: float = 15.0
     craft_retry_hours: float = 1.0
     quorum_deadline_hours: float = 24.0
+    mail_poll_minutes: float = 5.0
 
 
 class EngineConfig(BaseModel):

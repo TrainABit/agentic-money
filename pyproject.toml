@@ -26,6 +26,9 @@ dev = [
   "pytest-asyncio==1.4.0",
   "ruff==0.16.3",
 ]
+mail = [
+  "agentmail>=0.5.6",
+]
 
 [project.scripts]
 sovereign = "sovereign.cli:main"
