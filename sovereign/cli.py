@@ -452,6 +452,91 @@ def cmd_debug(args: argparse.Namespace) -> int:
     return 0
 
 
+def _web_vault(world):
+    """The bootstrap-wired vault, or a local one on trees that predate it."""
+    vault = getattr(world, "web_vault", None)
+    if vault is not None:
+        return vault
+    from sovereign.web.vault import WebVault
+
+    return WebVault(world.wallet, world.config.paths().root / "web_sessions")
+
+
+def cmd_web_login(args: argparse.Namespace) -> int:
+    from sovereign.web.login import (
+        capture_headful_login,
+        import_session_file,
+        normalize_storage_state,
+        request_web_login,
+    )
+
+    world = bootstrap(_config(args))
+    vault = _web_vault(world)
+    host = vault._domain_key(args.domain)
+    if args.import_file:
+        report = import_session_file(vault, host, Path(args.import_file))
+        print(json.dumps({"ok": True, **report}, indent=2))
+        return 0
+    if args.headful:
+        url = args.url or f"https://{host}/"
+        try:
+            from sovereign.web.session import default_driver_factory
+
+            class _HeadfulShim:
+                """Driver config: visible browser, full page, patient timeout."""
+
+                headless = False
+                block_media = False
+                nav_timeout_ms = 60000
+
+            def _started_driver():
+                driver = default_driver_factory(_HeadfulShim())
+                try:
+                    driver.start()
+                except BaseException:
+                    driver.stop()
+                    raise
+                return driver
+
+            state = normalize_storage_state(
+                capture_headful_login(url, driver_factory=_started_driver)
+            )
+            vault.save_session(host, state)
+        except Exception as exc:  # missing [web] extra, display, or browser
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": str(exc) or type(exc).__name__,
+                        "hint": "use --import with an exported storage_state json",
+                    },
+                    indent=2,
+                )
+            )
+            return 1
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "domain": host,
+                    "cookies": len(state["cookies"]),
+                    "origins": len(state["origins"]),
+                },
+                indent=2,
+            )
+        )
+        return 0
+    request = request_web_login(world, host, args.url or "")
+    print(json.dumps(request, indent=2))
+    return 0
+
+
+def cmd_web_sessions(args: argparse.Namespace) -> int:
+    world = bootstrap(_config(args))
+    print(json.dumps(_web_vault(world).list_domains(), indent=2))
+    return 0
+
+
 def _globals(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--data-dir", default="data")
     sp.add_argument("--mode", default="sim", choices=["sim", "live"])
@@ -602,6 +687,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print the latest trace summary without running any ticks",
     )
     s.set_defaults(func=cmd_debug)
+
+    s = sub.add_parser(
+        "web-login",
+        help="Vault an encrypted browser session for a domain (import, headful, or ask a human)",
+    )
+    _globals(s)
+    s.add_argument("domain", help="Site hostname (a full URL is normalized to its host)")
+    s.add_argument("--url", default=None, help="Login page URL (defaults to https://DOMAIN/)")
+    s.add_argument(
+        "--import",
+        dest="import_file",
+        default=None,
+        metavar="FILE",
+        help="Vault an exported Playwright storage_state JSON file",
+    )
+    s.add_argument(
+        "--headful",
+        action="store_true",
+        help="Open a visible browser here, log in, and capture the session",
+    )
+    s.set_defaults(func=cmd_web_login)
+
+    s = sub.add_parser(
+        "web-sessions", help="List domains with a vaulted browser session (never secrets)"
+    )
+    _globals(s)
+    s.set_defaults(func=cmd_web_sessions)
     return p
 
 
