@@ -10,6 +10,7 @@ from sovereign.capital.treasury import Treasury
 from sovereign.capital.wallet import Wallet, derive_solana_keypair
 from sovereign.channels.human import HumanInbox
 from sovereign.config import EngineConfig
+from sovereign.debug import TraceCollector
 from sovereign.engine.schedule import Clock, Scheduler, SystemClock, aware_utc, elapsed, parse_datetime
 from sovereign.governance.council import Council
 from sovereign.governance.reputation import Reputation
@@ -45,6 +46,8 @@ class World:
     freeze_info: dict[str, dict[str, Any]] = field(default_factory=dict)
     tools: Any = None
     comms: Any = None
+    knowledge: Any = None
+    debug_trace: Any = None
     clock: Clock = field(default_factory=SystemClock)
     scheduler: Scheduler = field(init=False)
 
@@ -305,6 +308,11 @@ class World:
             "missions": self.store.missions(),
             "health": self.store.get_kv("health"),
             "skills": self.store.get_kv("skills"),
+            "debug": (
+                {"enabled": bool(self.debug_trace.enabled)}
+                if self.debug_trace is not None
+                else None
+            ),
             "tools": None if self.tools is None else {
                 "names": self.tools.names(),
                 "by_agent": {a: self.tools.available_to(a) for a in (
@@ -369,11 +377,14 @@ def bootstrap(config: EngineConfig, *, heal: bool = True, clock: Clock | None = 
     )
     from sovereign.agents.spec import roster
     from sovereign.comms.bus import Bus
+    from sovereign.memory.knowledge import KnowledgeBase
     from sovereign.tools.catalog import build_registry
 
     world.tools = build_registry()
     world.tools.bind(world)
     world.comms = Bus(store, roster())
+    world.knowledge = KnowledgeBase(store)
+    world.debug_trace = TraceCollector(paths.logs / "trace", config.debug)
     if store.get_kv("meta"):
         world.load_kv()
         world.identity.setdefault("name", config.firm_name)

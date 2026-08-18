@@ -98,7 +98,7 @@ def readiness(world: "World") -> dict[str, Any]:
     version = ".".join(str(part) for part in sys.version_info[:3])
     checks.append(_check("python_version", sys.version_info >= (3, 11), True, version))
 
-    findings = diagnose(world)
+    findings = diagnose(world, deep=True)
     failing = [f.code for f in findings if not f.ok and f.code not in _INFORMATIONAL_FINDINGS]
     checks.append(
         _check(

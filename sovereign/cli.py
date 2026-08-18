@@ -12,7 +12,8 @@ import yaml
 from sovereign.agents.spec import AGENT_SPECS, spec_for
 from sovereign.comms.bus import STATUSES as COMMS_STATUSES
 from sovereign.config import EngineConfig
-from sovereign.engine.heartbeat import step
+from sovereign.debug import TraceCollector
+from sovereign.engine.heartbeat import TICK_METRICS_KEY, step
 from sovereign.engine.world import bootstrap, load_prices
 from sovereign.markets.data import certify, fetch_closes
 from sovereign.ops import readiness
@@ -369,6 +370,88 @@ def cmd_mail(args: argparse.Namespace) -> int:
     return 0
 
 
+def _harvest_trace_errors(trace_files: list[Path]) -> list[dict[str, object]]:
+    """Agent failures (short error + traceback tail) from trace event lines."""
+    errors: list[dict[str, object]] = []
+    for path in trace_files:
+        for line in path.read_text().splitlines()[1:]:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("event") == "agent" and event.get("error"):
+                errors.append(
+                    {
+                        "agent": event.get("agent"),
+                        "error": event.get("error"),
+                        "traceback_tail": event.get("traceback_tail"),
+                    }
+                )
+    return errors
+
+
+def cmd_debug(args: argparse.Namespace) -> int:
+    cfg = _config(args)
+
+    if args.show:
+        collector = TraceCollector(cfg.paths().logs / "trace", cfg.debug)
+        latest = collector.latest(1)
+        if not latest:
+            print(json.dumps({"trace_file": None, "summary": None,
+                              "note": "no trace files yet; run `sovereign debug --ticks N`"}, indent=2))
+            return 0
+        print(json.dumps(
+            {"trace_file": str(latest[0]), "summary": collector.read_summary(latest[0])},
+            indent=2,
+            default=str,
+        ))
+        return 0
+
+    # Force tracing on for this process regardless of persisted config.
+    cfg.debug.enabled = True
+    world = bootstrap(cfg)
+    reports = [step(world) for _ in range(max(0, args.ticks))]
+
+    ring = world.store.get_kv(TICK_METRICS_KEY)
+    ring = ring if isinstance(ring, list) else []
+    run_ticks = {report["tick"] for report in reports}
+    agent_totals: dict[str, float] = {}
+    for entry in ring:
+        if not isinstance(entry, dict) or entry.get("tick") not in run_ticks:
+            continue
+        for agent, ms in (entry.get("agents_ms") or {}).items():
+            agent_totals[agent] = agent_totals.get(agent, 0.0) + float(ms)
+    slowest_agents = {
+        agent: round(total, 1)
+        for agent, total in sorted(agent_totals.items(), key=lambda kv: kv[1], reverse=True)
+    }
+
+    stats = world.tools.stats_snapshot() if world.tools is not None else {}
+    slowest_tools = [
+        {"tool": name, **entry}
+        for name, entry in sorted(
+            stats.items(), key=lambda kv: kv[1]["total_ms"], reverse=True
+        )[:8]
+    ]
+
+    trace_files = sorted(world.debug_trace.latest(len(reports))) if reports else []
+    durations = [float(report["duration_ms"]) for report in reports]
+    print(json.dumps(
+        {
+            "ticks_run": len(reports),
+            "avg_tick_ms": round(sum(durations) / len(durations), 2) if durations else 0,
+            "slowest_tools": slowest_tools,
+            "slowest_agents": slowest_agents,
+            "comms": world.comms.counts() if world.comms is not None else {},
+            "errors": _harvest_trace_errors(trace_files),
+            "trace_files": [str(path) for path in trace_files],
+        },
+        indent=2,
+        default=str,
+    ))
+    return 0
+
+
 def _globals(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--data-dir", default="data")
     sp.add_argument("--mode", default="sim", choices=["sim", "live"])
@@ -506,6 +589,19 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("mail", help="List mailbox")
     _globals(s)
     s.set_defaults(func=cmd_mail)
+
+    s = sub.add_parser(
+        "debug",
+        help="Trace N ticks and report hot tools/agents, or show the latest trace",
+    )
+    _globals(s)
+    s.add_argument("--ticks", type=int, default=3, help="Traced ticks to run")
+    s.add_argument(
+        "--show",
+        action="store_true",
+        help="Print the latest trace summary without running any ticks",
+    )
+    s.set_defaults(func=cmd_debug)
     return p
 
 

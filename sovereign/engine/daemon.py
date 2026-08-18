@@ -87,6 +87,7 @@ def serve(
                 )
             log.warning("serving despite failing required readiness checks: %s", names)
         log.info("daemon start mode=%s pid=%s", config.mode, os.getpid())
+        idle_state: bool | None = None  # None until the first successful tick
         while not stop["flag"]:
             try:
                 r = step(world)
@@ -114,7 +115,25 @@ def serve(
                 )
             if ticks and n >= ticks:
                 break
-            time.sleep(max(0.05, config.tick_seconds if config.mode == "live" else 0.05))
+            if config.mode == "live":
+                # Adaptive throttle: idle engines poll less often. The
+                # transition is logged once per state change, not every tick.
+                idle = bool(r.get("idle"))
+                delay = (
+                    max(config.tick_seconds, config.idle_tick_seconds)
+                    if idle
+                    else config.tick_seconds
+                )
+                if idle is not idle_state:
+                    idle_state = idle
+                    log.info(
+                        "engine %s; sleeping %.1fs between ticks",
+                        "idle" if idle else "active",
+                        delay,
+                    )
+                time.sleep(max(0.05, delay))
+            else:
+                time.sleep(0.05)
     finally:
         lock.release()
         log.info("daemon stop after %s ticks", n)

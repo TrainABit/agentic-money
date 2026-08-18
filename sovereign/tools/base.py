@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
-from typing import Any, Callable, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from sovereign.engine.world import World
@@ -33,6 +34,8 @@ class Registry:
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
         self.world: World | None = None
+        # In-memory per-tool call accounting; never persisted.
+        self.stats: dict[str, dict[str, float]] = {}
 
     def bind(self, world: World) -> None:
         self.world = world
@@ -62,6 +65,7 @@ class Registry:
         if not tool.allows(caller):
             world.store.emit("tool_denied", {"tool": name}, caller)
             return ToolResult(False, error=f"denied: {caller} cannot use {name}")
+        started = time.monotonic()
         try:
             if tool.wants_caller:
                 # The authenticated caller always wins: a "caller" kwarg smuggled
@@ -70,11 +74,51 @@ class Registry:
                 data = tool.fn(world, caller=caller, **kwargs)
             else:
                 data = tool.fn(world, **kwargs)
+            ms = (time.monotonic() - started) * 1000.0
+            self._observe(world, caller, name, ms, True, None)
             world.store.emit("tool", {"tool": name, "ok": True}, caller)
             return ToolResult(True, data=data)
         except Exception as e:
-            world.store.emit("tool", {"tool": name, "ok": False, "error": str(e)[:240]}, caller)
+            ms = (time.monotonic() - started) * 1000.0
+            error = str(e)[:240]
+            self._observe(world, caller, name, ms, False, error)
+            world.store.emit("tool", {"tool": name, "ok": False, "error": error}, caller)
             errs = dict(world.store.get_kv("tool_errors") or {})
             errs[name] = int(errs.get(name, 0)) + 1
             world.store.set_kv("tool_errors", errs)
-            return ToolResult(False, error=str(e)[:240])
+            return ToolResult(False, error=error)
+
+    def _observe(
+        self, world: World, caller: str, name: str, ms: float, ok: bool, error: str | None
+    ) -> None:
+        """Account one executed call: stats, slow-call event, debug trace."""
+        entry = self.stats.setdefault(
+            name, {"calls": 0, "errors": 0, "total_ms": 0.0, "max_ms": 0.0}
+        )
+        entry["calls"] = int(entry["calls"]) + 1
+        if not ok:
+            entry["errors"] = int(entry["errors"]) + 1
+        entry["total_ms"] = float(entry["total_ms"]) + ms
+        entry["max_ms"] = max(float(entry["max_ms"]), ms)
+        # Slow-call events carry the tool name and duration only — never
+        # kwargs or payloads.
+        if ms > float(world.config.debug.slow_tool_ms):
+            world.store.emit("tool_slow", {"tool": name, "ms": round(ms, 1)}, caller)
+        collector = getattr(world, "debug_trace", None)
+        if collector is not None:
+            collector.record_tool(caller, name, ms, ok, error=error)
+
+    def stats_snapshot(self) -> dict[str, dict[str, float]]:
+        """Sanitized copy of the per-tool stats, with a derived avg_ms."""
+        snapshot: dict[str, dict[str, float]] = {}
+        for name, entry in sorted(self.stats.items()):
+            calls = int(entry["calls"])
+            total_ms = float(entry["total_ms"])
+            snapshot[name] = {
+                "calls": calls,
+                "errors": int(entry["errors"]),
+                "total_ms": round(total_ms, 3),
+                "max_ms": round(float(entry["max_ms"]), 3),
+                "avg_ms": round(total_ms / calls, 3) if calls else 0.0,
+            }
+        return snapshot

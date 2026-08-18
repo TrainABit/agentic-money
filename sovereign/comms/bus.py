@@ -223,8 +223,8 @@ class Bus:
             for recipient in targets
         ]
         with self.store.transaction():
-            for record in records:
-                self.store.insert_message(record)
+            # One executemany covers the whole fan-out.
+            self.store.insert_messages(records)
         return SendReceipt(thread, correlation, tuple(r["id"] for r in records))
 
     def broadcast(

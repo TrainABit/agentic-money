@@ -23,7 +23,7 @@ def setup(world: "World", full: bool = False) -> dict[str, Any]:
                 apply_repair(world, Finding("strategies", False, "full setup", True, "recertify"))
             except Exception:
                 pass
-    findings = diagnose(world)
+    findings = diagnose(world, deep=full)
     repairs: list[dict[str, Any]] = []
     for f in findings:
         if f.ok or not f.repairable or not f.repair:
@@ -35,7 +35,7 @@ def setup(world: "World", full: bool = False) -> dict[str, Any]:
             repairs.append({"code": f.code, "repair": f.repair, "ok": True})
         except Exception as e:
             repairs.append({"code": f.code, "repair": f.repair, "ok": False, "error": str(e)[:200]})
-    after = diagnose(world)
+    after = diagnose(world, deep=full)
     report = {
         "healthy": all(x.ok for x in after),
         "findings": [f.as_dict() for f in after],

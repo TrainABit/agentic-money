@@ -26,7 +26,10 @@ class Finding:
         }
 
 
-def diagnose(world: "World") -> list[Finding]:
+def diagnose(world: "World", deep: bool = False) -> list[Finding]:
+    """Engine health findings. ``deep`` adds the SQLite ``PRAGMA quick_check``
+    integrity scan, which is too slow for every cheap tick; the schema/table
+    checks always run."""
     paths = world.config.paths()
     out: list[Finding] = []
 
@@ -42,12 +45,13 @@ def diagnose(world: "World") -> list[Finding]:
         repair="ensure_paths",
     ))
 
-    try:
-        row = world.store.conn.execute("PRAGMA quick_check").fetchone()
-        q = str(row[0]) if row else "unknown"
-        out.append(Finding("sqlite", q == "ok", q, repairable=False))
-    except Exception as e:
-        out.append(Finding("sqlite", False, str(e)[:200], repairable=False))
+    if deep:
+        try:
+            row = world.store.conn.execute("PRAGMA quick_check").fetchone()
+            q = str(row[0]) if row else "unknown"
+            out.append(Finding("sqlite", q == "ok", q, repairable=False))
+        except Exception as e:
+            out.append(Finding("sqlite", False, str(e)[:200], repairable=False))
 
     needed = {"events", "ledger", "missions", "jobs", "votes", "outcomes", "kv", "invoices", "mail", "offers"}
     have = {r[0] for r in world.store.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}

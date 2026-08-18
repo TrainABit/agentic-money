@@ -249,7 +249,12 @@ byId('observer-token').addEventListener('keydown', (event) => {
   if (event.key === 'Enter') connectWithToken();
 });
 tick();
-setInterval(tick, 3000);
+// Poll every 5s, but never while the tab is hidden; catch up as soon as
+// the tab becomes visible again.
+setInterval(() => { if (!document.hidden) tick(); }, 5000);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) tick();
+});
 </script>
 </html>
 """
