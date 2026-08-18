@@ -84,6 +84,25 @@ authorized drop-in pipeline used for file leads — sender authorization still
 gates every accept/reject, and a transport failure queues the message with
 the error instead of losing it.
 
+### Operating real websites
+
+With the `[web]` extra (`playwright` + `playwright install chromium`) and an
+explicit opt-in, hunter/closer/operator/courier can operate real websites
+headlessly — navigate, log in via vaulted sessions, click, type, upload,
+download, and extract — with no desktop. `web.enabled` defaults to false and
+the domain allowlist is empty, so everything web fails closed until the
+operator turns it on in `data/config.yaml`. CAPTCHAs, 2FA, and first-time
+logins are hard human boundaries: the engine files one `web:<service>`
+request and the human completes it once via `sovereign web-login <domain>
+--import state.json` (or `--headful` on a machine with a display), after
+which the encrypted per-site session is reused. Sessions are sealed with the
+wallet master key under `data/web_sessions/`, credentials are typed only by
+ALLCAPS vault reference and never logged or echoed, all page content reaches
+agents fenced as untrusted data, and browser work is bounded by per-session
+and per-tick action caps, started lazily, and closed at tick end. The
+mandate still applies on the web: no fraud, spam, manipulation, or KYC
+evasion. Details: [`docs/WEB.md`](docs/WEB.md).
+
 Agents keep a searchable knowledge base (SQLite FTS5, LIKE fallback) with
 per-agent namespaces plus a shared `firm` namespace: the closer recalls
 won/lost-job lessons into its proposal prompts, the crafter/treasurer/trader

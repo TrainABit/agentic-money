@@ -93,6 +93,11 @@ def serve(
                 r = step(world)
             except Exception:
                 log.exception("tick crashed; healing")
+                if getattr(world, "web", None) is not None:
+                    try:
+                        world.web.close()  # never leave a browser running after a crash
+                    except Exception:
+                        log.exception("web close failed")
                 try:
                     heal_setup(world, full=True)
                 except Exception:

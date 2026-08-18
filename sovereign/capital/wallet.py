@@ -139,6 +139,14 @@ class Wallet:
         creds = raw.get("credentials") or {}
         return {k: bool(v) for k, v in creds.items()}
 
+    def encrypt_blob(self, data: bytes) -> bytes:
+        with file_lock(self.lock_path):
+            return _fernet(self.master_key_path).encrypt(data)
+
+    def decrypt_blob(self, token: bytes) -> bytes:
+        with file_lock(self.lock_path):
+            return _fernet(self.master_key_path).decrypt(token)
+
     def public(self) -> dict[str, str]:
         if not self.bundle:
             self.load_or_create()

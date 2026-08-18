@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import csv
+import re
+import uuid
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
+from urllib.parse import urlsplit
 
 from sovereign.agents.spec import spec_for, system_prompt_for, tool_matrix
 from sovereign.capital import invoice as invoices
@@ -17,6 +20,14 @@ from sovereign.tools.base import Registry, Tool
 
 NOTIFY_CAP_PER_TICK = 5
 NOTIFY_GUARD_KEY = "comms_notify_guard"
+
+WEB_GUARD_KEY = "web_action_guard"
+WEB_ACTIONS = frozenset(
+    {"click", "type", "type_secret", "press", "upload", "extract", "screenshot"}
+)
+# Credential refs are ALLCAPS vault keys (e.g. UPWORK_PASSWORD), never values.
+_SECRET_REF_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,64}$")
+_WEB_EXTRACT_CHARS = 4000
 
 # (name, description, fn, wants_caller). Allowlists are NOT declared here:
 # they are derived from AGENT_SPECS so prompts and enforcement cannot drift.
@@ -106,6 +117,14 @@ def _tool_defs() -> list[ToolDef]:
            _ledger_export),
         _t("comms.notify", "Send a rate-capped notify to named agents over the bus",
            _comms_notify, wants_caller=True),
+        _t("web.navigate", "Open an allowlisted URL in the headless browser",
+           _web_navigate, wants_caller=True),
+        _t("web.act", "Act on the live page: click/type/type_secret/press/upload/extract/screenshot",
+           _web_act, wants_caller=True),
+        _t("web.session_status", "Vaulted and currently open web sessions (never secret values)",
+           _web_session_status, wants_caller=True),
+        _t("web.request_login", "File the one idempotent human ask that unlocks a site login",
+           _web_request_login, wants_caller=True),
     ]
 
 
@@ -239,6 +258,189 @@ def _ledger_export(w) -> dict[str, Any]:
                 [row["ts"], row["debit"], row["credit"], row["amount"], row["memo"], row["ref"]]
             )
     return {"path": str(path), "rows": len(rows)}
+
+
+# -- web automation -----------------------------------------------------------
+#
+# Spec-derived grants (hunter/closer/operator/courier; request_login excludes
+# hunter). Every tool fails closed on `w.web is None or not w.web.enabled`,
+# every navigate/act consumes one slot of the shared per-tick budget, page
+# content is returned only inside untrusted-data fences, and typed values —
+# secret or not — are never echoed back, stored, or logged.
+
+
+def _web_runtime(w):
+    web = getattr(w, "web", None)
+    if web is None or not getattr(web, "enabled", False):
+        raise RuntimeError("web disabled")
+    return web
+
+
+def _web_charge(w) -> None:
+    """One shared per-tick budget across web.navigate + web.act, mirroring
+    comms.notify's kv guard. Raises ValueError past the cap."""
+    cap = max(0, int(getattr(getattr(w.config, "web", None), "actions_per_tick", 0) or 0))
+    guard = w.store.get_kv(WEB_GUARD_KEY) or {}
+    count = int(guard.get("count", 0)) if guard.get("tick") == w.tick else 0
+    if count >= cap:
+        raise ValueError(f"web action cap reached ({cap} per tick)")
+    w.store.set_kv(WEB_GUARD_KEY, {"tick": w.tick, "count": count + 1})
+
+
+def _web_secret_resolver(w) -> Callable[[str], str]:
+    """Map an ALLCAPS credential ref to its vault value; "" when absent.
+
+    The value goes straight to the browser driver and is never returned to
+    the calling agent, stored, or logged.
+    """
+
+    def resolve(ref: str) -> str:
+        if not isinstance(ref, str) or not _SECRET_REF_RE.match(ref):
+            return ""
+        return w.wallet.get_credential(ref) or ""
+
+    return resolve
+
+
+def _web_host(url: str) -> str:
+    host = (urlsplit(str(url or "")).hostname or "").strip().lower()
+    if not host:
+        raise ValueError("url has no host")
+    return host
+
+
+def _web_page_summary(session, requires_human: str | None) -> dict[str, Any]:
+    state = session.snapshot(allow_human_gate=False)
+    return {
+        "url": state.url,
+        "title": state.title,
+        "content": state.as_untrusted(_WEB_EXTRACT_CHARS),
+        "links": [dict(link) for link in (state.links or ())[:20]],
+        "requires_human": requires_human or session.policy.requires_human(state),
+        "actions_used": session.actions_used,
+    }
+
+
+def _web_navigate(w, caller: str, url: str) -> dict[str, Any]:
+    from sovereign.web.session import (
+        HumanInterventionRequired,
+        WebActionError,
+        WebPolicyError,
+    )
+
+    from sovereign.web.session import redact_url
+
+    web = _web_runtime(w)
+    if not web.policy().allows(url):
+        # Checked before open() so a denied URL never starts a browser and
+        # never consumes tick budget. Redact any userinfo so a credentials-in-URL
+        # password never lands in the tool result.
+        return {"blocked": "policy", "detail": f"navigation denied by policy: {redact_url(url)}"}
+    _web_charge(w)
+    try:
+        session = web.open(_web_host(url), on_secret=_web_secret_resolver(w))
+        requires_human = None
+        try:
+            session.navigate(url)
+        except HumanInterventionRequired as exc:
+            requires_human = exc.reason
+        return _web_page_summary(session, requires_human)
+    except WebPolicyError as exc:
+        return {"blocked": "policy", "detail": str(exc)}
+    except WebActionError:
+        return {"blocked": "action_cap"}
+
+
+def _web_act(
+    w,
+    caller: str,
+    action: str,
+    selector: str | None = None,
+    value: str | None = None,
+    secret_ref: str | None = None,
+    domain: str | None = None,
+) -> dict[str, Any]:
+    from sovereign.web.session import (
+        HumanInterventionRequired,
+        WebActionError,
+        WebPolicyError,
+    )
+
+    web = _web_runtime(w)
+    if action not in WEB_ACTIONS:
+        raise ValueError(f"unknown web action {action!r}")
+    if action in {"click", "type", "type_secret", "press", "upload"} and not selector:
+        raise ValueError(f"web action {action!r} requires a selector")
+    if action in {"type", "upload"} and value is None:
+        raise ValueError(f"web action {action!r} requires a value")
+    if action == "type_secret" and (
+        not isinstance(secret_ref, str) or not _SECRET_REF_RE.match(secret_ref)
+    ):
+        raise ValueError("type_secret requires an ALLCAPS credential ref, never a value")
+    _web_charge(w)
+    try:
+        session = web.open(domain, on_secret=_web_secret_resolver(w))
+        if action == "extract":
+            return {
+                "content": session.extract(_WEB_EXTRACT_CHARS),
+                "requires_human": session.policy.requires_human(
+                    session.snapshot(allow_human_gate=False)
+                ),
+                "actions_used": session.actions_used,
+            }
+        if action == "screenshot":
+            shots = w.config.paths().artifacts / "web"
+            shots.mkdir(parents=True, exist_ok=True)
+            saved = session.screenshot(shots / f"shot_{uuid.uuid4().hex[:10]}.png")
+            return {
+                "screenshot": str(saved),
+                "requires_human": session.policy.requires_human(
+                    session.snapshot(allow_human_gate=False)
+                ),
+                "actions_used": session.actions_used,
+            }
+        requires_human = None
+        extra: dict[str, Any] = {}
+        try:
+            if action == "click":
+                session.click(selector)
+            elif action == "type":
+                session.type(selector, str(value))
+                extra["typed_chars"] = len(str(value))
+            elif action == "type_secret":
+                # The fill happens before the human gate, so "typed" is set
+                # first; only the length is ever reported, never the value.
+                extra["typed"] = True
+                extra["secret_chars"] = int(session.type_secret(selector, secret_ref))
+            elif action == "press":
+                session.press(selector, str(value or "Enter"))
+            elif action == "upload":
+                session.upload(selector, str(value))
+        except HumanInterventionRequired as exc:
+            requires_human = exc.reason
+        summary = _web_page_summary(session, requires_human)
+        summary.update(extra)
+        return summary
+    except WebPolicyError as exc:
+        return {"blocked": "policy", "detail": str(exc)}
+    except WebActionError:
+        return {"blocked": "action_cap"}
+
+
+def _web_session_status(w, caller: str) -> dict[str, Any]:
+    web = _web_runtime(w)
+    vault = getattr(w, "web_vault", None)
+    return {
+        "vaulted": vault.list_domains() if vault is not None else [],
+        "open": web.open_domains(),
+    }
+
+
+def _web_request_login(w, caller: str, service: str, url: str = "") -> dict[str, Any]:
+    from sovereign.web.login import request_web_login
+
+    _web_runtime(w)
+    return request_web_login(w, service, url)
 
 
 def _comms_notify(w, caller: str, recipients, payload) -> dict[str, Any]:
