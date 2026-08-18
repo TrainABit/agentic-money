@@ -83,6 +83,18 @@ set it higher than the number of proxies you control.
 The process handles `SIGINT` and `SIGTERM`, stops accepting new connections,
 allows active requests to finish, closes SQLite, and then exits.
 
+This dashboard never places orders and never accepts a Hyperliquid private
+key. Optional read-only market data:
+
+```bash
+HYPERLIQUID_INFO_URL=https://api.hyperliquid-testnet.xyz/info
+HYPERLIQUID_COINS=BTC,ETH
+HYPERLIQUID_ADDRESS=0xYourPublicAddress   # optional clearinghouse lookup
+```
+
+Setting `HYPERLIQUID_PRIVATE_KEY` (or similar) is refused at startup. Live
+execution lives in Sovereign on Hyperliquid (`docs/TRADING.md` in that tree).
+
 ## API
 
 | Method | Path | Description |
@@ -93,6 +105,7 @@ allows active requests to finish, closes SQLite, and then exits.
 | `GET` | `/api/budgets` | List budgets. |
 | `POST` | `/api/budgets` | Create/update a budget for a category. |
 | `GET` | `/api/summary` | Totals, per-category breakdown, and agent insights. |
+| `GET` | `/api/hyperliquid` | Read-only Hyperliquid mids (optional account if `HYPERLIQUID_ADDRESS` is set). |
 | `POST` | `/api/reset` | Clear transactions and budgets (disabled by default). |
 
 ### Example

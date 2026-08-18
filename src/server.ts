@@ -54,6 +54,11 @@ export async function startServer(
       publicDir: config.publicDir,
       rateLimit: config.rateLimit,
       trustProxy: config.trustProxy,
+      hyperliquid: {
+        infoUrl: config.hyperliquidInfoUrl,
+        coins: config.hyperliquidCoins,
+        address: config.hyperliquidAddress,
+      },
     });
     const server = app.listen(config.port, config.host);
 

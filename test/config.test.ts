@@ -67,6 +67,29 @@ describe("runtime configuration", () => {
     );
   });
 
+  it("loads read-only Hyperliquid settings and refuses private keys", () => {
+    const defaults = loadConfig({});
+    expect(defaults.hyperliquidInfoUrl).toContain("hyperliquid-testnet");
+    expect(defaults.hyperliquidCoins).toEqual(["BTC", "ETH"]);
+    expect(defaults.hyperliquidAddress).toBeUndefined();
+
+    expect(
+      loadConfig({
+        HYPERLIQUID_INFO_URL: "https://api.hyperliquid.xyz/info",
+        HYPERLIQUID_COINS: "btc, ETH,BTC",
+        HYPERLIQUID_ADDRESS: "0xabc",
+      }),
+    ).toMatchObject({
+      hyperliquidInfoUrl: "https://api.hyperliquid.xyz/info",
+      hyperliquidCoins: ["BTC", "ETH"],
+      hyperliquidAddress: "0xabc",
+    });
+
+    expect(() =>
+      loadConfig({ HYPERLIQUID_PRIVATE_KEY: "0xsecret" }),
+    ).toThrow(/read-only Hyperliquid/);
+  });
+
   it("accepts an explicit bounded reverse-proxy hop count", () => {
     expect(loadConfig({ TRUST_PROXY: "1" }).trustProxy).toBe(1);
     expect(loadConfig({ TRUST_PROXY: "2" }).trustProxy).toBe(2);

@@ -10,6 +10,12 @@ import express, {
 import { rateLimit } from "express-rate-limit";
 import helmet from "helmet";
 import { PUBLIC_DIR } from "./config.js";
+import {
+  DEFAULT_COINS,
+  DEFAULT_INFO_URL,
+  HyperliquidUnavailableError,
+  fetchHyperliquidSnapshot,
+} from "./hyperliquid.js";
 import { toMinorUnits } from "./money.js";
 import { Store } from "./store.js";
 import {
@@ -24,6 +30,12 @@ export interface AppOptions {
   publicDir?: string;
   rateLimit?: number | false;
   trustProxy?: number;
+  hyperliquid?: {
+    infoUrl?: string;
+    coins?: readonly string[];
+    address?: string;
+    fetchImpl?: typeof fetch;
+  };
 }
 
 class HttpError extends Error {
@@ -197,6 +209,24 @@ export function createApp(store: Store, options: AppOptions = {}): Express {
 
   app.get("/api/summary", (_req: Request, res: Response) => {
     res.json(store.getSummary());
+  });
+
+  app.get("/api/hyperliquid", async (_req: Request, res: Response, next: NextFunction) => {
+    try {
+      const snapshot = await fetchHyperliquidSnapshot({
+        infoUrl: options.hyperliquid?.infoUrl ?? DEFAULT_INFO_URL,
+        coins: options.hyperliquid?.coins ?? DEFAULT_COINS,
+        address: options.hyperliquid?.address,
+        fetchImpl: options.hyperliquid?.fetchImpl,
+      });
+      res.json(snapshot);
+    } catch (error) {
+      if (error instanceof HyperliquidUnavailableError) {
+        sendError(res, 502, "hyperliquid_unavailable", error.message);
+        return;
+      }
+      next(error);
+    }
   });
 
   if (options.resetEnabled === true) {
