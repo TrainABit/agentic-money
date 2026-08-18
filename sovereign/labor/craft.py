@@ -5,10 +5,20 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from sovereign.labor.boards import deliverable_text
+from sovereign.labor.design import DESIGN_KEYWORDS, brand_kit
 from sovereign.security import job_child, safe_child, validate_job_id
 
 if TYPE_CHECKING:
     from sovereign.engine.world import World
+
+
+def _readme(title: str, desc: str, firm: str) -> str:
+    return (
+        f"# {title}\n\n"
+        f"Delivered by {firm}.\n\n"
+        f"## Brief\n{desc[:800]}\n\n"
+        f"## Run\nSee files in this folder. Entry is described below.\n"
+    )
 
 
 def produce(world: World, job: dict[str, Any]) -> dict[str, Any]:
@@ -20,16 +30,36 @@ def produce(world: World, job: dict[str, Any]) -> dict[str, Any]:
     desc = str(job.get("description") or "")
     blob = f"{title} {desc}".lower()
 
-    readme = (
-        f"# {title}\n\n"
-        f"Delivered by {world.config.firm_name}.\n\n"
-        f"## Brief\n{desc[:800]}\n\n"
-        f"## Run\nSee files in this folder. Entry is described below.\n"
-    )
-    (workdir / "README.md").write_text(readme)
+    (workdir / "README.md").write_text(_readme(title, desc, world.config.firm_name))
     (workdir / "DELIVERY.md").write_text(deliverable_text(job, world.config.firm_name))
 
-    if any(k in blob for k in ("csv", "data", "excel")):
+    if any(k in blob for k in DESIGN_KEYWORDS):
+        # Offline, deterministic brand kit. This branch sits first — ahead of
+        # the landing/copy branch — so an explicit design keyword (including
+        # "landing page") always wins over the draft page and over accidental
+        # substring hits like "bot" inside "robotics".
+        brand = " ".join(title.split()[:4]) or "Untitled brand"
+        for name, content in brand_kit(brand, desc).items():
+            (workdir / name).write_text(content)
+        # The whole design package is consumer-facing markup: regenerate the
+        # scaffolding with escaped inputs so a hostile title or brief cannot
+        # smuggle raw HTML into any file of the kit.
+        safe_job = dict(job)
+        safe_job["title"] = html.escape(title, quote=True)
+        safe_job["description"] = html.escape(desc, quote=True)
+        (workdir / "README.md").write_text(
+            _readme(
+                str(safe_job["title"]),
+                str(safe_job["description"]),
+                world.config.firm_name,
+            )
+        )
+        (workdir / "DELIVERY.md").write_text(
+            deliverable_text(safe_job, world.config.firm_name)
+        )
+        _mcp_design_hero(world, workdir, brand)
+        entry = "open index.html"
+    elif any(k in blob for k in ("csv", "data", "excel")):
         (workdir / "clean_csv.py").write_text(_csv_script())
         (workdir / "requirements.txt").write_text("# stdlib only\n")
         entry = "python clean_csv.py input.csv"
@@ -84,6 +114,43 @@ def produce(world: World, job: dict[str, Any]) -> dict[str, Any]:
             safe_child(dest, p.name, label="delivery file").write_bytes(p.read_bytes())
     files = sorted(p.name for p in dest.iterdir() if p.is_file() and not p.is_symlink())
     return {"workdir": str(workdir), "delivery": str(dest), "entry": entry, "files": files}
+
+
+def _mcp_design_hero(world: World, workdir: Path, brand: str) -> None:
+    """Best-effort MCP hero art for a design job.
+
+    The offline kit is the guaranteed deliverable, so a missing registry,
+    disabled config, absent image tool, or failed call is tolerated silently.
+    Runs only through the rate-capped mcp.call tool; the saved hero.txt holds
+    the fenced, untrusted result text.
+    """
+    try:
+        mcp = getattr(world, "mcp", None)
+        if mcp is None or not getattr(mcp, "enabled", False):
+            return
+        image_tool = next(
+            (
+                spec
+                for spec in mcp.tools_for("crafter")
+                if "image" in str(spec.name).lower()
+            ),
+            None,
+        )
+        if image_tool is None:
+            return
+        result = world.use_tool(
+            "crafter",
+            "mcp.call",
+            server=image_tool.server,
+            tool=image_tool.name,
+            arguments={"prompt": f"logo hero for {brand}"},
+        )
+        if result.ok and isinstance(result.data, dict) and result.data.get("ok"):
+            content = str(result.data.get("content") or "")
+            if content:
+                (workdir / "hero.txt").write_text(content)
+    except Exception:
+        pass
 
 
 def _csv_script() -> str:

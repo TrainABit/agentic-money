@@ -537,6 +537,52 @@ def cmd_web_sessions(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_mcp(args: argparse.Namespace) -> int:
+    world = bootstrap(_config(args))
+    mcp_cfg = world.config.mcp
+    servers = [
+        {
+            "name": s.name,
+            "transport": s.transport,
+            "allow_agents": list(s.allow_agents),
+            "allowed_tools": list(s.allowed_tools),
+            "calls_per_tick": s.calls_per_tick,
+        }
+        for s in mcp_cfg.servers
+        if not args.server or s.name == args.server
+    ]
+    if not args.probe:
+        # Config view only: no connect, and never commands, URLs, or
+        # credential references.
+        print(json.dumps({"enabled": mcp_cfg.enabled, "servers": servers}, indent=2))
+        return 0
+    registry = world.mcp
+    grouped: dict[str, list[dict[str, str]]] = {}
+    try:
+        for spec in registry.tools() if registry is not None else []:
+            if args.server and spec.server != args.server:
+                continue
+            grouped.setdefault(spec.server, []).append(
+                {"name": spec.name, "description": spec.description}
+            )
+        errors = registry.errors() if registry is not None else []
+    finally:
+        if registry is not None:
+            registry.close()
+    print(
+        json.dumps(
+            {
+                "enabled": mcp_cfg.enabled,
+                "servers": servers,
+                "tools": grouped,
+                "errors": errors,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
 def _globals(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--data-dir", default="data")
     sp.add_argument("--mode", default="sim", choices=["sim", "live"])
@@ -714,6 +760,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _globals(s)
     s.set_defaults(func=cmd_web_sessions)
+
+    s = sub.add_parser(
+        "mcp",
+        help="Show configured MCP servers (never secrets); --probe connects and lists tools",
+    )
+    _globals(s)
+    s.add_argument("--server", default=None, help="Limit output to one configured server")
+    s.add_argument(
+        "--probe",
+        action="store_true",
+        help="Connect and print discovered tools grouped by server plus any errors",
+    )
+    s.set_defaults(func=cmd_mcp)
     return p
 
 

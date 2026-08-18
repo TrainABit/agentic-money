@@ -25,6 +25,7 @@ WEB_GUARD_KEY = "web_action_guard"
 WEB_ACTIONS = frozenset(
     {"click", "type", "type_secret", "press", "upload", "extract", "screenshot"}
 )
+MCP_GUARD_KEY = "mcp_call_guard"
 # Credential refs are ALLCAPS vault keys (e.g. UPWORK_PASSWORD), never values.
 _SECRET_REF_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,64}$")
 _WEB_EXTRACT_CHARS = 4000
@@ -125,6 +126,10 @@ def _tool_defs() -> list[ToolDef]:
            _web_session_status, wants_caller=True),
         _t("web.request_login", "File the one idempotent human ask that unlocks a site login",
            _web_request_login, wants_caller=True),
+        _t("mcp.list", "List external MCP tools the caller may reach (never secrets)",
+           _mcp_list, wants_caller=True),
+        _t("mcp.call", "Call one external MCP tool; rate-capped, fenced untrusted output",
+           _mcp_call, wants_caller=True),
     ]
 
 
@@ -441,6 +446,71 @@ def _web_request_login(w, caller: str, service: str, url: str = "") -> dict[str,
 
     _web_runtime(w)
     return request_web_login(w, service, url)
+
+
+# -- MCP bridge ---------------------------------------------------------------
+#
+# Spec-derived grants (hunter/closer/crafter/publisher/scout/operator). Both
+# tools fail closed when the world carries no registry or the config is
+# disabled. mcp.call additionally enforces each server's calls_per_tick budget
+# through the kv guard below, and neither call arguments nor secret material
+# ever appear in a return value or event — only routing metadata plus the
+# registry's fenced, untrusted result text.
+
+
+def _mcp_list(w, caller: str) -> list[dict[str, str]]:
+    mcp = getattr(w, "mcp", None)
+    if mcp is None:
+        return []
+    return [
+        {"server": spec.server, "name": spec.name, "description": spec.description}
+        for spec in mcp.tools_for(caller)
+    ]
+
+
+def _mcp_server_config(w, server: str):
+    for cfg in getattr(getattr(w.config, "mcp", None), "servers", ()) or ():
+        if cfg.name == server:
+            return cfg
+    return None
+
+
+def _mcp_charge(w, server: str) -> None:
+    """One per-(tick, server) budget from that server's calls_per_tick,
+    mirroring the web guard. Raises ValueError past the cap; a server absent
+    from config is left for the registry to reject without consuming budget."""
+    cfg = _mcp_server_config(w, server)
+    if cfg is None:
+        return
+    cap = max(0, int(getattr(cfg, "calls_per_tick", 0) or 0))
+    guard = w.store.get_kv(MCP_GUARD_KEY) or {}
+    counts = dict(guard.get("counts") or {}) if guard.get("tick") == w.tick else {}
+    count = int(counts.get(server, 0))
+    if count >= cap:
+        raise ValueError(f"mcp rate cap reached for {server}")
+    counts[server] = count + 1
+    w.store.set_kv(MCP_GUARD_KEY, {"tick": w.tick, "counts": counts})
+
+
+def _mcp_call(
+    w, caller: str, server: str, tool: str, arguments: dict | None = None
+) -> dict[str, Any]:
+    mcp = getattr(w, "mcp", None)
+    if mcp is None or not getattr(mcp, "enabled", False):
+        raise RuntimeError("mcp disabled")
+    if arguments is None:
+        arguments = {}
+    if not isinstance(arguments, dict):
+        raise ValueError("arguments must be a dict")
+    _mcp_charge(w, str(server))
+    res = mcp.call(caller, str(server), str(tool), arguments)
+    return {
+        "server": str(server),
+        "tool": str(tool),
+        "ok": bool(res.ok),
+        "content": res.text,
+        "error": res.error,
+    }
 
 
 def _comms_notify(w, caller: str, recipients, payload) -> dict[str, Any]:

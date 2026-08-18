@@ -50,6 +50,17 @@ PLAYS: tuple[Play, ...] = (
         kill_after_days_if_zero=21,
     ),
     Play(
+        id="design_studio",
+        title="Design studio",
+        thesis="Sell brand kits, landing pages, and social graphics as fixed-price packages; offline generation keeps marginal cost near zero, MCP image tools sweeten the kit.",
+        agents=("crafter", "publisher", "closer", "scout"),
+        attention_until_min=0.05,
+        attention_until_rec=0.12,
+        attention_after_rec=0.15,
+        monthly_target_usd=1500,
+        kill_after_days_if_zero=21,
+    ),
+    Play(
         id="tsmom_crypto",
         title="Certified crypto momentum",
         thesis="Vol-targeted time-series momentum on BTC/ETH. Compounds treasury; does not pay rent from dust.",

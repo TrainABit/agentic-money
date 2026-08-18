@@ -1088,6 +1088,14 @@ def scout(world: World) -> list[dict[str, Any]]:
             "status": "listed",
             "ts": world.stamp(),
         },
+        {
+            "id": "offer_design_kit",
+            "title": "Brand kit + landing page",
+            "kind": "fixed",
+            "price_usd": 900,
+            "status": "listed",
+            "ts": world.stamp(),
+        },
     ]
     for o in catalog:
         world.store.upsert_offer(o)
@@ -1097,6 +1105,26 @@ def scout(world: World) -> list[dict[str, Any]]:
         + "\n".join(f"- **{o['title']}** — ${o['price_usd']:.0f} ({o['kind']})" for o in catalog)
         + f"\n\nPay USDC `{world.identity.get('eth')}`\n"
     )
+    # Bounded, best-effort visibility into operator-configured MCP tools.
+    # Skipped entirely when the bridge is disabled, so sim/disabled action
+    # dicts keep their exact prior shape.
+    mcp_tools: list[str] = []
+    if bool(getattr(getattr(world, "mcp", None), "enabled", False)):
+        listed = world.use_tool("scout", "mcp.list")
+        if listed.ok and isinstance(listed.data, list):
+            mcp_tools = sorted(
+                {
+                    str(t.get("name"))
+                    for t in listed.data
+                    if isinstance(t, dict) and t.get("name")
+                }
+            )[:8]
+
+    def _action(base: dict[str, Any]) -> list[dict[str, Any]]:
+        if mcp_tools:
+            base["mcp_tools"] = mcp_tools
+        return [base]
+
     if world.config.mode == "sim" and world.ledger.snapshot(now=world.now)["trailing_30d_usd"] >= 1500:
         if not any(j.get("id") == "retainer_inbox" for j in world.store.jobs()):
             world.store.upsert_job(
@@ -1109,6 +1137,22 @@ def scout(world: World) -> list[dict[str, Any]]:
                     "contact": "retainer@sim.local",
                 }
             )
+        # One seeded design sale (never more) so the design_studio play can
+        # earn in sim, mirroring the retainer seed above.
+        if not any(j.get("id") == "design_kit" for j in world.store.jobs()):
+            world.store.upsert_job(
+                {
+                    "id": "design_kit",
+                    "source": "product",
+                    "title": "Brand kit + landing page",
+                    "status": "delivered",
+                    "price_usd": 900,
+                    "contact": "buyer@sim.local",
+                }
+            )
+            world.store.outcome(
+                "product", 900.0, True, "Brand kit + landing page", "scout", "design_studio"
+            )
     if not world.scheduler.claim(
         "scout_model",
         now=world.now,
@@ -1116,7 +1160,7 @@ def scout(world: World) -> list[dict[str, Any]]:
         sim_every_ticks=10,
         live_every=timedelta(hours=world.config.live_timing.scout_cadence_hours),
     ):
-        return [{"kind": "scout", "offers": len(catalog)}]
+        return _action({"kind": "scout", "offers": len(catalog)})
     model = world.use_tool(
         "scout",
         "brain.complete",
@@ -1124,15 +1168,15 @@ def scout(world: World) -> list[dict[str, Any]]:
         tier="fast",
     )
     if not model.ok:
-        return [
+        return _action(
             {
                 "kind": "scout",
                 "ideas": catalog,
                 "operation": "brain.complete",
                 "error": model.error,
             }
-        ]
-    return [{"kind": "scout", "ideas": catalog, "note": str(model.data or "")}]
+        )
+    return _action({"kind": "scout", "ideas": catalog, "note": str(model.data or "")})
 
 
 _QUORUM_SEATS = ("treasurer", "risk", "director")

@@ -50,6 +50,7 @@ class World:
     debug_trace: Any = None
     web: Any = None
     web_vault: Any = None
+    mcp: Any = None
     clock: Clock = field(default_factory=SystemClock)
     scheduler: Scheduler = field(init=False)
 
@@ -103,6 +104,13 @@ class World:
         if getattr(self, "web", None):
             try:
                 self.web.close()
+            except Exception:
+                pass
+        # Any MCP client (and its stdio subprocess) built during the tick is
+        # closed here; the registry lazily reconnects on next use.
+        if getattr(self, "mcp", None):
+            try:
+                self.mcp.close()
             except Exception:
                 pass
 
@@ -334,6 +342,13 @@ class World:
                 "sessions": (self.web_vault.list_domains() if self.web_vault else []),
                 "open": (self.web.open_domains() if self.web else []),
             },
+            # servers()/errors() read config and cached state only — status
+            # must never connect, so tools() is deliberately not called here.
+            "mcp": {
+                "enabled": bool(getattr(self.mcp, "enabled", False)),
+                "servers": (self.mcp.servers() if self.mcp else []),
+                "errors": (len(self.mcp.errors()) if self.mcp else 0),
+            },
             "tools": None if self.tools is None else {
                 "names": self.tools.names(),
                 "by_agent": {a: self.tools.available_to(a) for a in (
@@ -411,6 +426,11 @@ def bootstrap(config: EngineConfig, *, heal: bool = True, clock: Clock | None = 
 
     world.web_vault = WebVault(wallet, paths.root / "web_sessions")
     world.web = WebRuntime(config.web, vault=world.web_vault)
+    from sovereign.mcp import McpRegistry
+
+    world.mcp = McpRegistry(
+        config.mcp, secret_resolver=lambda ref: wallet.get_credential(ref) or ""
+    )
     if store.get_kv("meta"):
         world.load_kv()
         world.identity.setdefault("name", config.firm_name)

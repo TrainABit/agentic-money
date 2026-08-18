@@ -184,6 +184,8 @@ def readiness(world: "World") -> dict[str, Any]:
 
     checks.append(_check("web", True, False, _web_summary(world)))
 
+    checks.append(_check("mcp", True, False, _mcp_summary(world)))
+
     ready = all(check["ok"] for check in checks if check["required"])
     return {"ready": ready, "mode": world.config.mode, "checks": checks}
 
@@ -199,6 +201,33 @@ def _web_summary(world: "World") -> dict[str, Any]:
         "enabled": bool(getattr(getattr(world, "web", None), "enabled", False)),
         "playwright": importlib.util.find_spec("playwright") is not None,
         "vaulted_sessions": vaulted,
+    }
+
+
+def _mcp_summary(world: "World") -> dict[str, Any]:
+    """Informational MCP-bridge state: never gates readiness or health.
+
+    Reads config plus the registry's cached servers()/errors() only — it must
+    never call tools(), which connects and can spawn server subprocesses.
+    """
+    registry = getattr(world, "mcp", None)
+    try:
+        servers = (
+            len(registry.servers())
+            if registry is not None
+            else len(getattr(getattr(world.config, "mcp", None), "servers", ()) or ())
+        )
+    except Exception:
+        servers = 0
+    try:
+        errors = len(registry.errors()) if registry is not None else 0
+    except Exception:
+        errors = 0
+    return {
+        "enabled": bool(getattr(registry, "enabled", False)),
+        "sdk": importlib.util.find_spec("mcp") is not None,
+        "servers": servers,
+        "errors": errors,
     }
 
 
