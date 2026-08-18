@@ -48,6 +48,8 @@ class World:
     comms: Any = None
     knowledge: Any = None
     debug_trace: Any = None
+    web: Any = None
+    web_vault: Any = None
     clock: Clock = field(default_factory=SystemClock)
     scheduler: Scheduler = field(init=False)
 
@@ -89,6 +91,13 @@ class World:
             else self.stamp()
         )
         self.store.set_kv("tick_start", marker)
+        # Any browser opened during the tick is closed here so its per-domain
+        # session state is persisted to the vault. Never breaks a tick.
+        if getattr(self, "web", None):
+            try:
+                self.web.close()
+            except Exception:
+                pass
 
     def resume_tick_marker(self) -> None:
         marker = self.store.get_kv("tick_start") or {}
@@ -313,6 +322,11 @@ class World:
                 if self.debug_trace is not None
                 else None
             ),
+            "web": {
+                "enabled": bool(getattr(self.web, "enabled", False)),
+                "sessions": (self.web_vault.list_domains() if self.web_vault else []),
+                "open": (self.web.open_domains() if self.web else []),
+            },
             "tools": None if self.tools is None else {
                 "names": self.tools.names(),
                 "by_agent": {a: self.tools.available_to(a) for a in (
@@ -385,6 +399,11 @@ def bootstrap(config: EngineConfig, *, heal: bool = True, clock: Clock | None = 
     world.comms = Bus(store, roster())
     world.knowledge = KnowledgeBase(store)
     world.debug_trace = TraceCollector(paths.logs / "trace", config.debug)
+    from sovereign.web.session import WebRuntime
+    from sovereign.web.vault import WebVault
+
+    world.web_vault = WebVault(wallet, paths.root / "web_sessions")
+    world.web = WebRuntime(config.web, vault=world.web_vault)
     if store.get_kv("meta"):
         world.load_kv()
         world.identity.setdefault("name", config.firm_name)

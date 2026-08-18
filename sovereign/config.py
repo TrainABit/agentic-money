@@ -63,6 +63,19 @@ class DebugConfig(BaseModel):
     include_tracebacks: bool = True
 
 
+class WebConfig(BaseModel):
+    """Headless web automation. Fail-closed: disabled and empty allowlist by
+    default, so no agent can touch a browser until the operator opts in."""
+
+    enabled: bool = False
+    headless: bool = True
+    allow_domains: tuple[str, ...] = ()
+    max_actions: int = 25
+    nav_timeout_ms: int = 30000
+    block_media: bool = True
+    actions_per_tick: int = 40
+
+
 class LiveTiming(BaseModel):
     """Wall-clock lifecycle limits and bounded live cadences."""
 
@@ -94,6 +107,7 @@ class EngineConfig(BaseModel):
     idle_tick_seconds: float = 60.0
     tick_hours: float = 24.0
     debug: DebugConfig = Field(default_factory=DebugConfig)
+    web: WebConfig = Field(default_factory=WebConfig)
     goals: Goals = Field(default_factory=Goals)
     risk: RiskLimits = Field(default_factory=RiskLimits)
     models: ModelConfig = Field(default_factory=ModelConfig)

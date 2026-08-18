@@ -4,6 +4,7 @@ import json
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import numpy as np
 
@@ -347,6 +348,179 @@ def _needs_verified_channel(world: World, job: dict[str, Any]) -> bool:
     )
 
 
+def _web_ready(world: World) -> bool:
+    """True only in live mode with an enabled web runtime. Fail closed."""
+    web = getattr(world, "web", None)
+    return (
+        world.config.mode == "live"
+        and web is not None
+        and bool(getattr(web, "enabled", False))
+    )
+
+
+def _closer_web_target(world: World, job: dict[str, Any]) -> str | None:
+    """Host for an opt-in web apply, or None to keep the default email path.
+
+    Requires live mode, an enabled web runtime, an allowlisted ``apply_url``,
+    and a vaulted session for its host. Anything unexpected fails closed to
+    None so the existing email/needs_channel flow never regresses.
+    """
+    if not _web_ready(world):
+        return None
+    url = str(job.get("apply_url") or "")
+    if not url:
+        return None
+    try:
+        if not world.web.policy().allows(url):
+            return None
+        host = (urlsplit(url).hostname or "").strip().lower()
+        vault = getattr(world, "web_vault", None)
+        if not host or vault is None or not vault.has_session(host):
+            return None
+    except Exception:
+        return None
+    return host
+
+
+_WEB_APPLY_FORM_TOKENS = ("form", "apply", "submit")
+
+
+def _closer_web_blocked(
+    world: World,
+    job: dict[str, Any],
+    host: str,
+    entry: dict[str, Any],
+    reason: str,
+    *,
+    park: bool = False,
+) -> dict[str, Any]:
+    if park:
+        job["status"] = "needs_channel"
+        job["needs_channel_reason"] = f"web_apply:{reason}"
+        world.store.upsert_job(job)
+        entry["status"] = "needs_channel"
+    else:
+        entry["status"] = "blocked"
+    entry["reason"] = reason
+    lesson_error = _remember_lesson(
+        world, "closer", "web_apply", f"blocked | {reason} | {host} | {job.get('title', '')}"
+    )
+    if lesson_error:
+        entry["knowledge_error"] = lesson_error
+    return entry
+
+
+def _closer_web_handoff(
+    world: World,
+    job: dict[str, Any],
+    host: str,
+    url: str,
+    entry: dict[str, Any],
+    reason: str,
+) -> dict[str, Any]:
+    """A captcha/2FA/login wall: file the one login ask and park the job."""
+    asked = world.use_tool("closer", "web.request_login", service=host, url=url)
+    job["status"] = "needs_channel"
+    job["needs_channel_reason"] = f"web_requires_human:{reason}"
+    world.store.upsert_job(job)
+    entry.update(
+        {
+            "status": "needs_channel",
+            "requires_human": reason,
+            "login_requested": bool(asked.ok),
+        }
+    )
+    if not asked.ok:
+        entry["login_request_error"] = asked.error
+    lesson_error = _remember_lesson(
+        world, "closer", "web_apply", f"blocked | {reason} | {host} | {job.get('title', '')}"
+    )
+    if lesson_error:
+        entry["knowledge_error"] = lesson_error
+    return entry
+
+
+def _closer_web_apply(world: World, job: dict[str, Any], host: str) -> dict[str, Any]:
+    """Bounded, fail-closed web application for one job.
+
+    navigate -> extract (confirm a form) -> fill the job-provided
+    ``apply_selectors`` -> submit. Any requires_human answer hands off via
+    web.request_login and parks the job as needs_channel; a policy or
+    action-cap block leaves the job untouched for a later tick.
+    """
+    url = str(job.get("apply_url") or "")
+    entry: dict[str, Any] = {"id": job["id"], "channel": "web", "host": host}
+
+    nav = world.use_tool("closer", "web.navigate", url=url)
+    if not nav.ok or not isinstance(nav.data, dict):
+        entry.update({"status": "error", "operation": "web.navigate", "error": nav.error})
+        return entry
+    if nav.data.get("blocked"):
+        return _closer_web_blocked(world, job, host, entry, str(nav.data["blocked"]))
+    if nav.data.get("requires_human"):
+        return _closer_web_handoff(
+            world, job, host, url, entry, str(nav.data["requires_human"])
+        )
+
+    extracted = world.use_tool("closer", "web.act", action="extract", domain=host)
+    if not extracted.ok or not isinstance(extracted.data, dict):
+        entry.update({"status": "error", "operation": "web.act", "error": extracted.error})
+        return entry
+    if extracted.data.get("blocked"):
+        return _closer_web_blocked(world, job, host, entry, str(extracted.data["blocked"]))
+    if extracted.data.get("requires_human"):
+        return _closer_web_handoff(
+            world, job, host, url, entry, str(extracted.data["requires_human"])
+        )
+    content = str(extracted.data.get("content") or "").lower()
+    if not any(token in content for token in _WEB_APPLY_FORM_TOKENS):
+        return _closer_web_blocked(
+            world, job, host, entry, "no_form_detected", park=True
+        )
+
+    raw_selectors = job.get("apply_selectors")
+    selectors = dict(raw_selectors) if isinstance(raw_selectors, dict) else {}
+    submit_selector = selectors.pop("submit", None)
+    steps: list[tuple[str, str, str | None]] = [
+        ("type", str(sel), str(val)) for sel, val in selectors.items()
+    ]
+    if submit_selector:
+        steps.append(("click", str(submit_selector), None))
+    for action, sel, val in steps:
+        kwargs: dict[str, Any] = {"action": action, "selector": sel, "domain": host}
+        if action == "type":
+            kwargs["value"] = val
+        acted = world.use_tool("closer", "web.act", **kwargs)
+        if not acted.ok or not isinstance(acted.data, dict):
+            entry.update({"status": "error", "operation": "web.act", "error": acted.error})
+            return entry
+        if acted.data.get("blocked"):
+            return _closer_web_blocked(world, job, host, entry, str(acted.data["blocked"]))
+        if acted.data.get("requires_human"):
+            return _closer_web_handoff(
+                world, job, host, url, entry, str(acted.data["requires_human"])
+            )
+
+    job["status"] = "applied"
+    job["applied_tick"] = world.tick
+    job["applied_ts"] = world.stamp()
+    job["applied_channel"] = "web"
+    world.store.upsert_job(job)
+    entry.update(
+        {
+            "status": "applied",
+            "price": job.get("price_usd"),
+            "submitted": bool(submit_selector),
+        }
+    )
+    lesson_error = _remember_lesson(
+        world, "closer", "web_apply", f"won | {host} | {job.get('title', '')}"
+    )
+    if lesson_error:
+        entry["knowledge_error"] = lesson_error
+    return entry
+
+
 def closer(world: World) -> list[dict[str, Any]]:
     for j in world.store.jobs("applied"):
         if world.config.mode == "sim":
@@ -360,8 +534,12 @@ def closer(world: World) -> list[dict[str, Any]]:
     candidates = world.store.jobs("open") + world.store.jobs("queued_budget")
     results = []
     open_jobs = []
+    web_jobs: list[tuple[dict[str, Any], str]] = []
     for job in candidates:
-        if _needs_verified_channel(world, job):
+        web_host = _closer_web_target(world, job)
+        if web_host is not None:
+            web_jobs.append((job, web_host))
+        elif _needs_verified_channel(world, job):
             job["status"] = "needs_channel"
             world.store.upsert_job(job)
             results.append(
@@ -374,6 +552,25 @@ def closer(world: World) -> list[dict[str, Any]]:
             )
         else:
             open_jobs.append(job)
+    cap = world.config.apply_cap()
+    day = world.now.date().isoformat()
+    counts = dict(world.store.get_kv("apply_by_day") or {})
+    applied_today = int(counts.get(day, 0))
+    # Opt-in web applies run first: they need no model tokens and no email
+    # channel. Bounded to 3 attempts per tick; only submitted applications
+    # consume the shared daily apply cap.
+    web_attempted = 0
+    for job, web_host in web_jobs[:3]:
+        if applied_today >= cap:
+            break
+        entry = _closer_web_apply(world, job, web_host)
+        results.append(entry)
+        web_attempted += 1
+        if entry.get("status") == "applied":
+            applied_today += 1
+    if web_attempted:
+        counts[day] = applied_today
+        world.store.set_kv("apply_by_day", counts)
     if world.config.mode == "live":
         world.router.remaining_budget()
         if world.router.degraded:
@@ -386,13 +583,8 @@ def closer(world: World) -> list[dict[str, Any]]:
                 }
             ]
     open_jobs.sort(key=lambda j: j.get("fit", 0), reverse=True)
-    cap = world.config.apply_cap()
-    day = world.now.date().isoformat()
-    counts = dict(world.store.get_kv("apply_by_day") or {})
-    already = int(counts.get(day, 0))
-    send_limit = min(3 if world.config.mode == "sim" else 2, max(0, cap - already))
+    send_limit = min(3 if world.config.mode == "sim" else 2, max(0, cap - applied_today))
     rate = world.config.sim.close_rate if world.config.mode == "sim" else 1.0
-    applied_today = already
     sent_count = 0
     for job in open_jobs:
         if sent_count >= send_limit:
@@ -1302,6 +1494,37 @@ def courier(world: World) -> list[dict[str, Any]]:
                 ["AGENTMAIL_API_KEY", "AGENTMAIL_INBOX_ID"],
                 "Real outbound/inbound email. The file outbox still works.",
             )
+    # Queue exactly one web login ask per allowlisted apply_url host that has
+    # no vaulted session yet (human.ask dedupes on the open web:<host>
+    # service, so re-running is idempotent). Fail closed: any error is
+    # reported, never raised, and nothing runs in sim or with web disabled.
+    web_login_hosts: list[str] = []
+    web_login_error: str | None = None
+    if _web_ready(world):
+        try:
+            policy = world.web.policy()
+            vault = getattr(world, "web_vault", None)
+            seen_hosts: set[str] = set()
+            for job in world.store.jobs():
+                if job.get("status") not in ("open", "needs_channel", "queued_budget"):
+                    continue
+                url = str(job.get("apply_url") or "")
+                if not url or not policy.allows(url):
+                    continue
+                host = (urlsplit(url).hostname or "").strip().lower()
+                if not host or host in seen_hosts:
+                    continue
+                seen_hosts.add(host)
+                try:
+                    if vault is not None and vault.has_session(host):
+                        continue
+                except ValueError:
+                    continue
+                asked = world.use_tool("courier", "web.request_login", service=host, url=url)
+                if asked.ok:
+                    web_login_hosts.append(host)
+        except Exception as exc:  # noqa: BLE001 - web wiring must never break courier
+            web_login_error = str(exc)[:200]
     open_q = world.human.open()
     action: dict[str, Any] = {
         "kind": "courier",
@@ -1310,4 +1533,8 @@ def courier(world: World) -> list[dict[str, Any]]:
     }
     if poll_report is not None:
         action["agentmail"] = poll_report
+    if web_login_hosts:
+        action["web_logins_requested"] = web_login_hosts
+    if web_login_error:
+        action["web_login_error"] = web_login_error
     return [action]

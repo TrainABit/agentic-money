@@ -191,6 +191,21 @@ def diagnose(world: "World", deep: bool = False) -> list[Finding]:
             repairable=False,
         ))
 
+    # Informational only: web automation is opt-in, so its state can never
+    # fail health or trigger a repair.
+    from sovereign.ops import _web_summary
+
+    web = _web_summary(world)
+    out.append(Finding(
+        "web",
+        ok=True,
+        detail=(
+            f"enabled={web['enabled']} playwright={web['playwright']} "
+            f"vaulted_sessions={web['vaulted_sessions']}"
+        ),
+        repairable=False,
+    ))
+
     return out
 
 

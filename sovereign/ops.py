@@ -13,6 +13,7 @@ and :func:`sanitized_messages` lists bus messages without their payloads.
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
@@ -181,8 +182,24 @@ def readiness(world: "World") -> dict[str, Any]:
         _check("certification", bool(certified), False, f"{len(certified)} certified strategies")
     )
 
+    checks.append(_check("web", True, False, _web_summary(world)))
+
     ready = all(check["ok"] for check in checks if check["required"])
     return {"ready": ready, "mode": world.config.mode, "checks": checks}
+
+
+def _web_summary(world: "World") -> dict[str, Any]:
+    """Informational web-automation state: never gates readiness or health."""
+    vault = getattr(world, "web_vault", None)
+    try:
+        vaulted = len(vault.list_domains()) if vault is not None else 0
+    except Exception:
+        vaulted = 0
+    return {
+        "enabled": bool(getattr(getattr(world, "web", None), "enabled", False)),
+        "playwright": importlib.util.find_spec("playwright") is not None,
+        "vaulted_sessions": vaulted,
+    }
 
 
 # How many recent events to scan when aggregating incidents. Matches the
