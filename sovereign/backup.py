@@ -22,7 +22,7 @@ from typing import Any
 from sovereign.config import EngineConfig
 from sovereign.fileio import atomic_write_text
 
-__all__ = ["create_backup", "verify_backup", "MANIFEST_NAME"]
+__all__ = ["create_backup", "restore_drill", "verify_backup", "MANIFEST_NAME"]
 
 MANIFEST_NAME = "manifest.json"
 DB_NAME = "sovereign.db"
@@ -197,4 +197,59 @@ def verify_backup(out_dir: Path) -> dict[str, Any]:
         "files_checked": checked,
         "quick_check": quick_check,
         "errors": errors,
+    }
+
+
+def restore_drill(config: EngineConfig, work_dir: Path) -> dict[str, Any]:
+    """Create a backup, verify it, and probe the snapshot without restoring.
+
+    Writes into ``work_dir/backup``. The live data directory is never
+    mutated. A drill is the operator's proof that last night's backup
+    procedure still produces a readable, schema-current database.
+    """
+    backup_dir = Path(work_dir) / "backup"
+    manifest = create_backup(config, backup_dir)
+    verify = verify_backup(backup_dir)
+    probe: dict[str, Any] = {}
+    db_path = backup_dir / DB_NAME
+    if verify["ok"] and db_path.is_file():
+        connection = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
+        try:
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            jobs = (
+                int(connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0])
+                if "jobs" in tables
+                else 0
+            )
+            ledger_rows = (
+                int(connection.execute("SELECT COUNT(*) FROM ledger").fetchone()[0])
+                if "ledger" in tables
+                else 0
+            )
+            probe = {
+                "schema_version": version,
+                "tables": sorted(tables),
+                "jobs": jobs,
+                "ledger_rows": ledger_rows,
+            }
+        finally:
+            connection.close()
+    return {
+        "ok": bool(verify["ok"]),
+        "backup": str(backup_dir),
+        "manifest": {
+            "created_ts": manifest.get("created_ts"),
+            "engine_version": manifest.get("engine_version"),
+            "include_secrets": manifest.get("include_secrets"),
+            "master_key_excluded": manifest.get("master_key_excluded"),
+            "file_count": len(manifest.get("files") or {}),
+        },
+        "verify": verify,
+        "probe": probe,
     }

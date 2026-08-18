@@ -8,6 +8,8 @@ import struct
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from typing import TYPE_CHECKING, Any
+
 import base58
 from cryptography.fernet import Fernet
 from eth_account import Account
@@ -15,6 +17,9 @@ from mnemonic import Mnemonic
 from nacl.signing import SigningKey
 
 from sovereign.fileio import atomic_write_bytes, file_lock
+
+if TYPE_CHECKING:
+    from sovereign.config import EngineConfig, Paths
 
 Account.enable_unaudited_hdwallet_features()
 
@@ -28,15 +33,113 @@ class WalletBundle:
     sol_secret: str
 
 
-def _fernet(master_key_path: Path) -> Fernet:
-    lock_path = master_key_path.with_name(master_key_path.name + ".lock")
-    with file_lock(lock_path):
-        if master_key_path.exists():
-            key = master_key_path.read_bytes()
-        else:
+class MasterKeyStore:
+    """Source of the Fernet master key that encrypts ``secrets.enc``."""
+
+    backend: str = "unknown"
+
+    def get_or_create_key(self) -> bytes:
+        """Return the base64 Fernet key, generating and persisting it once."""
+        raise NotImplementedError
+
+    def replace_key(self, key: bytes) -> None:
+        """Overwrite the persisted master key with ``key``."""
+        raise NotImplementedError
+
+
+class FileMasterKeyStore(MasterKeyStore):
+    """Default custody: the key file co-located with ``secrets.enc``.
+
+    Byte-for-byte the historical ``_fernet`` behavior: read
+    ``master_key_path`` when present, else generate a key and write it 0600,
+    all under the same ``<name>.lock`` file lock.
+    """
+
+    backend = "file"
+
+    def __init__(self, master_key_path: Path) -> None:
+        self.master_key_path = master_key_path
+
+    def get_or_create_key(self) -> bytes:
+        lock_path = self.master_key_path.with_name(self.master_key_path.name + ".lock")
+        with file_lock(lock_path):
+            if self.master_key_path.exists():
+                return self.master_key_path.read_bytes()
             key = Fernet.generate_key()
-            atomic_write_bytes(master_key_path, key, mode=0o600)
-    return Fernet(key)
+            atomic_write_bytes(self.master_key_path, key, mode=0o600)
+            return key
+
+    def replace_key(self, key: bytes) -> None:
+        lock_path = self.master_key_path.with_name(self.master_key_path.name + ".lock")
+        with file_lock(lock_path):
+            atomic_write_bytes(self.master_key_path, key, mode=0o600)
+
+
+class KeyringMasterKeyStore(MasterKeyStore):
+    """Opt-in custody in the OS keyring, so the master key never sits on disk
+    next to ``secrets.enc``.
+
+    The ``keyring`` import is lazy: the optional dependency is only needed
+    when this backend is actually used. ``keyring_module`` allows dependency
+    injection (tests pass an in-memory fake).
+    """
+
+    backend = "keyring"
+
+    def __init__(
+        self,
+        service: str = "sovereign",
+        username: str = "master_key",
+        keyring_module: Any | None = None,
+    ) -> None:
+        self.service = service
+        self.username = username
+        self._keyring = keyring_module
+
+    def _module(self) -> Any:
+        if self._keyring is None:
+            try:
+                import keyring
+            except ImportError as exc:
+                raise RuntimeError(
+                    "master_key_backend='keyring' requires the optional "
+                    "'keyring' package; install it with: "
+                    "pip install 'sovereign[keyring]'"
+                ) from exc
+            self._keyring = keyring
+        return self._keyring
+
+    def get_or_create_key(self) -> bytes:
+        kr = self._module()
+        stored = kr.get_password(self.service, self.username)
+        if stored:
+            return stored.encode("ascii")
+        key = Fernet.generate_key()
+        kr.set_password(self.service, self.username, key.decode("ascii"))
+        return key
+
+    def replace_key(self, key: bytes) -> None:
+        self._module().set_password(self.service, self.username, key.decode("ascii"))
+
+
+def master_key_store_from_config(config: "EngineConfig", paths: "Paths") -> MasterKeyStore:
+    """Build the master-key backend selected by ``config.wallet``.
+
+    Bootstrap should pass ``Wallet(..., key_store=master_key_store_from_config(
+    config, paths))`` when ``config.wallet.master_key_backend == "keyring"``;
+    the default file backend needs no wiring.
+    """
+    if config.wallet.master_key_backend == "keyring":
+        return KeyringMasterKeyStore(
+            service=config.wallet.keyring_service,
+            username=config.wallet.keyring_username,
+        )
+    return FileMasterKeyStore(paths.master_key)
+
+
+def _fernet(master_key_path: Path) -> Fernet:
+    """Historical helper: Fernet from the file-backed master key."""
+    return Fernet(FileMasterKeyStore(master_key_path).get_or_create_key())
 
 
 def derive_solana_keypair(mnemonic: str) -> tuple[str, str]:
@@ -76,15 +179,50 @@ def generate_bundle(mnemonic: str | None = None) -> WalletBundle:
 
 
 class Wallet:
-    def __init__(self, secrets_path: Path, master_key_path: Path) -> None:
+    def __init__(
+        self,
+        secrets_path: Path,
+        master_key_path: Path,
+        key_store: MasterKeyStore | None = None,
+    ) -> None:
         self.secrets_path = secrets_path
         self.master_key_path = master_key_path
+        # Default (None) keeps today's behavior: file-backed master key at
+        # master_key_path. Passing a store (e.g. KeyringMasterKeyStore) is
+        # strictly opt-in and changes nothing about secrets.enc handling.
+        self.key_store: MasterKeyStore = key_store or FileMasterKeyStore(master_key_path)
         self.bundle: WalletBundle | None = None
         self.lock_path = self.secrets_path.with_name(self.secrets_path.name + ".lock")
 
+    def _fernet(self) -> Fernet:
+        return Fernet(self.key_store.get_or_create_key())
+
+    def _rotating_path(self) -> Path:
+        return self.secrets_path.with_name(self.secrets_path.name + ".rotating")
+
+    def _promote_rotating(self, f: Fernet) -> dict | None:
+        """Finish a crash-interrupted rotation if the staged blob decrypts."""
+        rotating = self._rotating_path()
+        if not rotating.exists():
+            return None
+        try:
+            blob = rotating.read_bytes()
+            raw = json.loads(f.decrypt(blob).decode())
+        except Exception:
+            return None
+        atomic_write_bytes(self.secrets_path, blob, mode=0o600)
+        rotating.unlink(missing_ok=True)
+        if self.bundle is None and raw.get("wallet"):
+            self.bundle = WalletBundle(**raw["wallet"])
+        return raw
+
     def load_or_create(self) -> WalletBundle:
         with file_lock(self.lock_path):
-            f = _fernet(self.master_key_path)
+            f = self._fernet()
+            promoted = self._promote_rotating(f)
+            if promoted is not None:
+                assert self.bundle
+                return self.bundle
             if self.secrets_path.exists():
                 raw = json.loads(f.decrypt(self.secrets_path.read_bytes()).decode())
                 self.bundle = WalletBundle(**raw["wallet"])
@@ -94,7 +232,10 @@ class Wallet:
             return self.bundle
 
     def _read_unlocked(self) -> dict:
-        f = _fernet(self.master_key_path)
+        f = self._fernet()
+        promoted = self._promote_rotating(f)
+        if promoted is not None:
+            return promoted
         if not self.secrets_path.exists():
             self.bundle = generate_bundle()
             payload = {"wallet": asdict(self.bundle), "credentials": {}}
@@ -105,12 +246,72 @@ class Wallet:
             self.bundle = WalletBundle(**raw["wallet"])
         return raw
 
+    def rotate_master_key(self) -> dict[str, Any]:
+        """Re-encrypt ``secrets.enc`` with a newly generated master key.
+
+        The new ciphertext is staged at ``secrets.enc.rotating`` before the
+        store is updated, so a crash mid-rotation is recovered on the next
+        load (see ``_promote_rotating``). Never returns key material.
+        """
+        with file_lock(self.lock_path):
+            payload = self._read_unlocked()
+            new_key = Fernet.generate_key()
+            blob = Fernet(new_key).encrypt(json.dumps(payload).encode())
+            rotating = self._rotating_path()
+            atomic_write_bytes(rotating, blob, mode=0o600)
+            self.key_store.replace_key(new_key)
+            checked = json.loads(Fernet(new_key).decrypt(rotating.read_bytes()).decode())
+            if not checked.get("wallet"):
+                raise RuntimeError("rotation produced an unreadable secrets blob")
+            atomic_write_bytes(self.secrets_path, rotating.read_bytes(), mode=0o600)
+            rotating.unlink(missing_ok=True)
+            if checked.get("wallet"):
+                self.bundle = WalletBundle(**checked["wallet"])
+        return {"ok": True, "backend": self.key_store.backend}
+
+    def migrate_key_store(
+        self,
+        new_store: MasterKeyStore,
+        *,
+        delete_old_file: bool = False,
+    ) -> dict[str, Any]:
+        """Re-encrypt under ``new_store`` and switch the live backend.
+
+        Used to move a file-backed master key into the OS keyring (or the
+        other way). The old ``master.key`` is left in place unless
+        ``delete_old_file`` is set — deleting it is irreversible.
+        """
+        with file_lock(self.lock_path):
+            payload = self._read_unlocked()
+            new_key = Fernet.generate_key()
+            blob = Fernet(new_key).encrypt(json.dumps(payload).encode())
+            rotating = self._rotating_path()
+            atomic_write_bytes(rotating, blob, mode=0o600)
+            new_store.replace_key(new_key)
+            checked = json.loads(Fernet(new_key).decrypt(rotating.read_bytes()).decode())
+            if not checked.get("wallet"):
+                raise RuntimeError("key-store migration produced an unreadable secrets blob")
+            atomic_write_bytes(self.secrets_path, rotating.read_bytes(), mode=0o600)
+            rotating.unlink(missing_ok=True)
+            self.key_store = new_store
+            if checked.get("wallet"):
+                self.bundle = WalletBundle(**checked["wallet"])
+            removed = False
+            if delete_old_file and self.master_key_path.exists():
+                self.master_key_path.unlink()
+                removed = True
+        return {
+            "ok": True,
+            "backend": new_store.backend,
+            "old_file_removed": removed,
+        }
+
     def _read(self) -> dict:
         with file_lock(self.lock_path):
             return self._read_unlocked()
 
     def _write_unlocked(self, payload: dict, *, f: Fernet | None = None) -> None:
-        f = f or _fernet(self.master_key_path)
+        f = f or self._fernet()
         blob = f.encrypt(json.dumps(payload).encode())
         atomic_write_bytes(self.secrets_path, blob, mode=0o600)
 
@@ -141,11 +342,11 @@ class Wallet:
 
     def encrypt_blob(self, data: bytes) -> bytes:
         with file_lock(self.lock_path):
-            return _fernet(self.master_key_path).encrypt(data)
+            return self._fernet().encrypt(data)
 
     def decrypt_blob(self, token: bytes) -> bytes:
         with file_lock(self.lock_path):
-            return _fernet(self.master_key_path).decrypt(token)
+            return self._fernet().decrypt(token)
 
     def public(self) -> dict[str, str]:
         if not self.bundle:

@@ -29,10 +29,16 @@ The engine does not wait for a bank.
    readiness gate first and refuses an unready live start (`--force`
    overrides after you have read the failing checks).
 9. Schedule `sovereign backup --out /path/outside/the/box` (and test restores
-   with `sovereign backup --verify`). The backup contains the online SQLite
-   snapshot, playbooks, invoices, artifacts, and `secrets.enc` — never
-   `data/master.key`, which you must store separately for the backup to be
-   decryptable.
+   with `sovereign backup --verify`). Rehearse without touching live data
+   with `sovereign backup --restore-drill /tmp/drill`. The backup contains
+   the online SQLite snapshot, playbooks, invoices, artifacts, and
+   `secrets.enc` — never `data/master.key`, which you must store separately
+   for the backup to be decryptable.
+10. Optional OS-keyring custody: `pip install -e ".[keyring]"`, then set
+    `wallet.master_key_backend: keyring` in `data/config.yaml` before the
+    first init (or `sovereign rotate-key --confirm --to-keyring` later).
+11. Containers and systemd: [`docs/DEPLOY.md`](DEPLOY.md). Day-two
+    operations: [`docs/RUNBOOK.md`](RUNBOOK.md).
 
 If something is broken (corrupt `human_inbox.json`, missing playbook, stale
 `engine.lock`, unbound tools), do not start from scratch: `sovereign setup`

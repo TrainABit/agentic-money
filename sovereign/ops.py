@@ -6,6 +6,10 @@ bootstrap`` exit code; informational checks surface state a human should know
 about (legacy wallets, certification coverage, comms backlog) without
 blocking a healthy engine.
 
+:func:`healthcheck` wraps :func:`readiness` with an optional last-tick
+staleness bound into a single never-raising verdict — the exec probe behind
+``sovereign healthcheck`` (Docker HEALTHCHECK, Kubernetes exec probes).
+
 :func:`metrics` is the read-only runtime snapshot behind the dashboard,
 :func:`write_weekly_report` renders the ISO-week markdown operations report,
 and :func:`sanitized_messages` lists bus messages without their payloads.
@@ -15,6 +19,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
@@ -28,12 +33,20 @@ from sovereign.comms.bus import (
     Bus,
 )
 from sovereign.engine.heartbeat import TICK_METRICS_KEY
+from sovereign.engine.schedule import aware_utc, parse_datetime
 from sovereign.heal.checks import diagnose
 
 if TYPE_CHECKING:
     from sovereign.engine.world import World
 
-__all__ = ["metrics", "readiness", "sanitized_messages", "write_weekly_report"]
+__all__ = [
+    "healthcheck",
+    "maintain",
+    "metrics",
+    "readiness",
+    "sanitized_messages",
+    "write_weekly_report",
+]
 
 # Surfaced as a dedicated informational check instead: a legacy Solana wallet
 # is a preserved configuration, not a blocker, so it must not fail readiness
@@ -228,6 +241,163 @@ def _mcp_summary(world: "World") -> dict[str, Any]:
         "sdk": importlib.util.find_spec("mcp") is not None,
         "servers": servers,
         "errors": errors,
+    }
+
+
+def _probe_now(world: "World") -> datetime:
+    """The later of the world's own time and the wall clock, tz-aware.
+
+    ``world.now`` is authoritative for simulated worlds, where time runs far
+    ahead of the wall clock. A probe process over a live data dir loads
+    ``now`` from the last persisted tick, so there the world clock (real wall
+    time) is what exposes a daemon that stopped ticking.
+    """
+    candidates: list[datetime] = []
+    try:
+        parsed = parse_datetime(getattr(world, "now", None))
+        if parsed is not None:
+            candidates.append(parsed)
+    except Exception:
+        pass
+    try:
+        clock = getattr(world, "clock", None)
+        candidates.append(
+            aware_utc(clock.now()) if clock is not None else datetime.now(timezone.utc)
+        )
+    except Exception:
+        candidates.append(datetime.now(timezone.utc))
+    return max(candidates)
+
+
+def healthcheck(
+    world: "World", *, max_staleness_seconds: float | None = None
+) -> dict[str, Any]:
+    """Exec-probe verdict for containers and orchestrators; never raises.
+
+    Without ``max_staleness_seconds`` this is a readiness probe: ``ok``
+    mirrors :func:`readiness`. With a bound it doubles as a liveness probe:
+    ``ok`` additionally requires the newest recorded tick timestamp — the
+    ``tick_start`` kv the daemon writes every tick, falling back to the
+    ``meta`` kv — to be no older than the bound. A missing timestamp counts
+    as stale only when a bound was requested. Any internal failure comes
+    back as ``ok=False`` with the reason listed instead of an exception, so
+    exit-code callers can always trust the verdict.
+    """
+    reasons: list[str] = []
+    mode = "unknown"
+    tick = 0
+    ready = False
+    stale = False
+    last_tick_ts: str | None = None
+
+    try:
+        mode = str(world.config.mode)
+        tick = int(getattr(world, "tick", 0) or 0)
+    except Exception as exc:
+        reasons.append(f"world state unreadable: {exc}"[:200])
+
+    try:
+        report = readiness(world)
+        ready = bool(report.get("ready"))
+        if not ready:
+            failing = [
+                str(check.get("name"))
+                for check in report.get("checks", [])
+                if check.get("required") and not check.get("ok")
+            ]
+            reasons.append(
+                "failing required readiness checks: " + (", ".join(failing) or "unknown")
+            )
+    except Exception as exc:
+        reasons.append(f"readiness probe failed: {exc}"[:200])
+
+    try:
+        marker = world.store.get_kv("tick_start")
+        marker = marker if isinstance(marker, dict) else {}
+        try:
+            marked = marker.get("tick")
+            if marked is not None:
+                tick = max(tick, int(marked))
+        except (TypeError, ValueError):
+            pass
+        newest: datetime | None = None
+        for raw in (marker.get("started_ts"), marker.get("completed_ts")):
+            parsed = parse_datetime(raw)
+            if parsed is not None and (newest is None or parsed >= newest):
+                newest, last_tick_ts = parsed, str(raw)
+        if newest is None:
+            meta = world.store.get_kv("meta")
+            raw = meta.get("now") if isinstance(meta, dict) else None
+            parsed = parse_datetime(raw)
+            if parsed is not None:
+                newest, last_tick_ts = parsed, str(raw)
+        if max_staleness_seconds is not None:
+            bound = float(max_staleness_seconds)
+            if newest is None:
+                stale = True
+                reasons.append("no tick timestamp recorded yet (no tick_start or meta kv)")
+            else:
+                age = max(timedelta(0), _probe_now(world) - newest).total_seconds()
+                if age > bound:
+                    stale = True
+                    reasons.append(
+                        f"last tick at {last_tick_ts} is {age:.0f}s old (max {bound:g}s)"
+                    )
+    except Exception as exc:
+        if max_staleness_seconds is not None:
+            stale = True
+        reasons.append(f"staleness check failed: {exc}"[:200])
+
+    return {
+        # reasons only ever carries failures, so a healthy probe stays
+        # exactly `ready and not stale` while any internal error fails it.
+        "ok": bool(ready and not stale and not reasons),
+        "ready": ready,
+        "mode": mode,
+        "tick": tick,
+        "last_tick_ts": last_tick_ts,
+        "stale": stale,
+        "reasons": reasons,
+    }
+
+
+def maintain(
+    world: "World",
+    *,
+    vacuum: bool | None = None,
+    comms_days: float | None = None,
+) -> dict[str, Any]:
+    """Prune retained rows and optionally compact the SQLite file.
+
+    Event pruning uses the store's configured retention cap. Comms pruning
+    deletes done/expired rows older than ``comms_days`` (default
+    ``config.retention.comms_days``). VACUUM is skipped when
+    ``config.retention.vacuum_on_maintain`` is false unless the caller
+    overrides ``vacuum``.
+    """
+    retention = getattr(world.config, "retention", None)
+    days = float(comms_days if comms_days is not None else getattr(retention, "comms_days", 30.0))
+    do_vacuum = (
+        bool(vacuum)
+        if vacuum is not None
+        else bool(getattr(retention, "vacuum_on_maintain", True))
+    )
+    world.store.prune_events()
+    comms_pruned = 0
+    bus = getattr(world, "comms", None)
+    if bus is not None:
+        comms_pruned = bus.prune(now=world.now, older_than_days=days)
+    if do_vacuum:
+        world.store.vacuum()
+    events = int(world.store.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+    return {
+        "ok": True,
+        "schema_version": world.store.schema_version(),
+        "events": events,
+        "event_retention": world.store.event_retention,
+        "comms_pruned": comms_pruned,
+        "comms_days": days,
+        "vacuum": do_vacuum,
     }
 
 

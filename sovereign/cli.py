@@ -16,7 +16,7 @@ from sovereign.debug import TraceCollector
 from sovereign.engine.heartbeat import TICK_METRICS_KEY, step
 from sovereign.engine.world import bootstrap, load_prices
 from sovereign.markets.data import certify, fetch_closes
-from sovereign.ops import readiness
+from sovereign.ops import healthcheck, maintain, readiness
 
 
 def _config(args: argparse.Namespace) -> EngineConfig:
@@ -277,21 +277,98 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
 
 def cmd_backup(args: argparse.Namespace) -> int:
-    from sovereign.backup import create_backup, verify_backup
+    from sovereign.backup import create_backup, restore_drill, verify_backup
 
-    if args.out and args.verify:
-        raise ValueError("--out and --verify are mutually exclusive; pass exactly one")
+    chosen = [flag for flag in (args.out, args.verify, args.restore_drill) if flag]
+    if len(chosen) != 1:
+        raise ValueError(
+            "--out, --verify, and --restore-drill are mutually exclusive; "
+            "pass exactly one of --out DIR, --verify DIR, or --restore-drill DIR"
+        )
     if args.verify:
         report = verify_backup(Path(args.verify))
         print(json.dumps(report, indent=2, default=str))
         return 0 if report["ok"] else 1
-    if not args.out:
-        raise ValueError("backup needs --out DIR to create one or --verify DIR to check one")
+    if args.restore_drill:
+        report = restore_drill(_config(args), Path(args.restore_drill))
+        print(json.dumps(report, indent=2, default=str))
+        return 0 if report["ok"] else 1
     manifest = create_backup(
         _config(args), Path(args.out), include_secrets=not args.no_secrets
     )
     print(json.dumps(manifest, indent=2, default=str))
     return 0
+
+
+def cmd_healthcheck(args: argparse.Namespace) -> int:
+    try:
+        world = bootstrap(_config(args), heal=False)
+        report = healthcheck(world, max_staleness_seconds=args.stale_seconds)
+    except Exception as exc:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "ready": False,
+                    "stale": args.stale_seconds is not None,
+                    "reasons": [str(exc) or type(exc).__name__],
+                },
+                indent=2,
+            )
+        )
+        return 1
+    print(json.dumps(report, indent=2, default=str))
+    return 0 if report["ok"] else 1
+
+
+def cmd_maintain(args: argparse.Namespace) -> int:
+    world = bootstrap(_config(args))
+    report = maintain(
+        world,
+        vacuum=False if args.no_vacuum else None,
+        comms_days=args.comms_days,
+    )
+    print(json.dumps(report, indent=2, default=str))
+    return 0 if report.get("ok") else 1
+
+
+def cmd_migrate(args: argparse.Namespace) -> int:
+    from sovereign.memory.store import CURRENT_SCHEMA_VERSION
+
+    world = bootstrap(_config(args))
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "schema_version": world.store.schema_version(),
+                "current": CURRENT_SCHEMA_VERSION,
+                "history": world.store.schema_history(),
+            },
+            indent=2,
+            default=str,
+        )
+    )
+    return 0
+
+
+def cmd_rotate_key(args: argparse.Namespace) -> int:
+    if not args.confirm:
+        raise ValueError("rotating the master key requires --confirm (stop the daemon first)")
+    world = bootstrap(_config(args))
+    if args.to_keyring:
+        from sovereign.capital.wallet import KeyringMasterKeyStore
+
+        report = world.wallet.migrate_key_store(
+            KeyringMasterKeyStore(
+                service=world.config.wallet.keyring_service,
+                username=world.config.wallet.keyring_username,
+            ),
+            delete_old_file=args.delete_old_file,
+        )
+    else:
+        report = world.wallet.rotate_master_key()
+    print(json.dumps(report, indent=2))
+    return 0 if report.get("ok") else 1
 
 
 _COMMS_FIELDS = ("id", "ts", "kind", "sender", "recipient", "status", "attempts", "error")
@@ -708,7 +785,68 @@ def build_parser() -> argparse.ArgumentParser:
         "--verify", default=None, metavar="DIR", help="Verify a backup directory against its manifest"
     )
     s.add_argument("--no-secrets", action="store_true", help="Leave secrets.enc out of the backup")
+    s.add_argument(
+        "--restore-drill",
+        default=None,
+        metavar="DIR",
+        help="Create a backup under DIR/backup, verify it, and probe the snapshot (never restores onto the live dir)",
+    )
     s.set_defaults(func=cmd_backup)
+
+    s = sub.add_parser(
+        "healthcheck",
+        help="Exec probe: readiness, plus optional last-tick staleness (Docker/K8s)",
+    )
+    _globals(s)
+    s.add_argument(
+        "--stale-seconds",
+        type=float,
+        default=None,
+        metavar="N",
+        help="Also fail when the newest tick timestamp is older than N seconds",
+    )
+    s.set_defaults(func=cmd_healthcheck)
+
+    s = sub.add_parser(
+        "maintain",
+        help="Prune retained events/comms and compact the SQLite file",
+    )
+    _globals(s)
+    s.add_argument("--no-vacuum", action="store_true", help="Skip VACUUM (prune only)")
+    s.add_argument(
+        "--comms-days",
+        type=float,
+        default=None,
+        metavar="D",
+        help="Prune done/expired messages older than D days (default: retention.comms_days)",
+    )
+    s.set_defaults(func=cmd_maintain)
+
+    s = sub.add_parser("migrate", help="Apply pending schema migrations and print the version")
+    _globals(s)
+    s.set_defaults(func=cmd_migrate)
+
+    s = sub.add_parser(
+        "rotate-key",
+        help="Re-encrypt secrets.enc with a new master key (stop the daemon first)",
+    )
+    _globals(s)
+    s.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Required: acknowledge that the daemon is stopped and you have a backup",
+    )
+    s.add_argument(
+        "--to-keyring",
+        action="store_true",
+        help="Move custody from the file backend into the OS keyring",
+    )
+    s.add_argument(
+        "--delete-old-file",
+        action="store_true",
+        help="With --to-keyring, delete data/master.key after a successful migrate",
+    )
+    s.set_defaults(func=cmd_rotate_key)
 
     s = sub.add_parser(
         "comms", help="List, requeue, or prune agent messages (payloads stay hidden)"

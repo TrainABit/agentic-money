@@ -1,0 +1,26 @@
+[Unit]
+Description=Sovereign autonomous economic engine
+Documentation=https://github.com/TrainABit/agentic-money
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sovereign
+Group=sovereign
+WorkingDirectory=/var/lib/sovereign
+ExecStart=/usr/local/bin/sovereign serve --data-dir /var/lib/sovereign --mode live
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=90
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sovereign
+# Liveness from a timer or orchestrator:
+#   sovereign healthcheck --data-dir /var/lib/sovereign --stale-seconds 300
+
+[Install]
+WantedBy=multi-user.target

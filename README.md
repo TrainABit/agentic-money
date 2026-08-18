@@ -20,7 +20,7 @@ are documented in [`docs/MODELS.md`](docs/MODELS.md).
 Labor cashflow is the path to $2k. Retainers/products are the path to $5–7k.
 Trading compounds a treasury; it does not pay rent from a tiny bankroll.
 
-Read the full plan: [`docs/PLAN.md`](docs/PLAN.md) · plays: [`docs/PLAYS.md`](docs/PLAYS.md) · bootstrap: [`docs/BOOTSTRAP.md`](docs/BOOTSTRAP.md)
+Read the full plan: [`docs/PLAN.md`](docs/PLAN.md) · plays: [`docs/PLAYS.md`](docs/PLAYS.md) · bootstrap: [`docs/BOOTSTRAP.md`](docs/BOOTSTRAP.md) · architecture: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) · runbook: [`docs/RUNBOOK.md`](docs/RUNBOOK.md) · deploy: [`docs/DEPLOY.md`](docs/DEPLOY.md)
 
 ## Quick start
 
@@ -38,8 +38,22 @@ sovereign backtest --live-data           # certify strategies on public BTC
 sovereign dashboard                      # observer: pipeline, invoices, wallets, health, metrics
 sovereign comms --status dead            # inspect bus messages; --requeue / --purge-days
 sovereign backup --out /path/backup      # online SQLite backup + manifest; --verify checks it
+sovereign backup --restore-drill /tmp/drill  # backup + verify + read-only probe (never restores live)
+sovereign healthcheck                    # Docker/K8s exec probe; --stale-seconds for liveness
+sovereign migrate                        # apply schema versions; print schema_log
+sovereign maintain                       # prune events/comms and VACUUM
+sovereign rotate-key --confirm           # re-encrypt secrets.enc; --to-keyring moves custody
 sovereign debug --ticks 3                # traced ticks: slowest tools/agents, comms, errors
 ```
+
+Packaging: `docker build -t sovereign .` (see [`docs/DEPLOY.md`](docs/DEPLOY.md)),
+`deploy/docker-compose.yml`, and `deploy/sovereign.service`. The image and
+the unit treat `sovereign healthcheck` as the probe.
+
+Master-key custody defaults to `data/master.key`. Set
+`wallet.master_key_backend: keyring` (and `pip install -e ".[keyring]"`)
+to keep the Fernet key out of the data directory. Rotate with
+`sovereign rotate-key --confirm` while the daemon is stopped.
 
 The dashboard is unauthenticated only on its default loopback bind. Every
 `/api/*` route requires `Authorization: Bearer …` when
@@ -202,8 +216,10 @@ injected via `sovereign reply` land in the same vault; after consume they are
 scrubbed from `human_inbox.json` and never written to the event log or
 `human_replies.json`. Use `KEY=-` to read a secret from stdin (not argv).
 `data/master.key` sits next to `secrets.enc` — encryption-at-rest only helps
-if the key is copied separately; prefer filesystem permissions. Mnemonic
-reveal requires `SOVEREIGN_CONFIRM_REVEAL=1`.
+if the key is copied separately; prefer filesystem permissions or the
+keyring backend. Mnemonic reveal requires `SOVEREIGN_CONFIRM_REVEAL=1`.
+Schema changes apply on open (`PRAGMA user_version`); `sovereign migrate`
+is the operator view. `sovereign maintain` is the retention/vacuum path.
 
 The Claude job crafter is jailed with `Path.relative_to` (not a string prefix)
 and Claude Code allowlists (`Read/Write/Edit/Glob/Grep`; no Bash). Job-board
