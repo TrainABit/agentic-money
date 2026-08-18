@@ -583,6 +583,37 @@ def cmd_mcp(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_alerts(args: argparse.Namespace) -> int:
+    from sovereign.alerts import AlertManager, detect
+
+    cfg = _config(args)
+    world = bootstrap(cfg)
+    manager = AlertManager(cfg.alerts)
+    if args.test:
+        print(json.dumps(manager.send_test(world), indent=2, default=str))
+        return 0
+    # Config view stays boolean for recipient/url so secrets (a webhook URL
+    # can embed a token) never reach stdout.
+    print(
+        json.dumps(
+            {
+                "alerts": [alert.as_dict() for alert in detect(world)],
+                "config": {
+                    "enabled": cfg.alerts.enabled,
+                    "channel": cfg.alerts.channel,
+                    "min_severity": cfg.alerts.min_severity,
+                    "throttle_minutes": cfg.alerts.throttle_minutes,
+                    "to_present": bool(cfg.alerts.to),
+                    "webhook_present": bool(cfg.alerts.webhook_url),
+                },
+            },
+            indent=2,
+            default=str,
+        )
+    )
+    return 0
+
+
 def _globals(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--data-dir", default="data")
     sp.add_argument("--mode", default="sim", choices=["sim", "live"])
@@ -773,6 +804,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Connect and print discovered tools grouped by server plus any errors",
     )
     s.set_defaults(func=cmd_mcp)
+
+    s = sub.add_parser(
+        "alerts",
+        help="Show detected P0/P1 incidents and alert config (never secrets)",
+    )
+    _globals(s)
+    s.add_argument(
+        "--test",
+        action="store_true",
+        help="Send one synthetic P0 test alert through the configured channel",
+    )
+    s.set_defaults(func=cmd_alerts)
     return p
 
 
